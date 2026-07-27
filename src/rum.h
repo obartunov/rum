@@ -712,6 +712,14 @@ typedef struct RumScanEntryData
 	/* used in fast scan in addition to preConsistentFn */
 	bool		preValue;
 
+	/* lazy first-page load: posting-tree entry positioned at the leftmost
+	 * leaf (buffer pinned) whose page has not yet been decoded into list.
+	 * Loaded by ensureEntryListLoaded() on first access, allocating in
+	 * scanCtx — the context startScanEntry ran in — since first access may
+	 * happen under a short-lived per-item context. */
+	bool		listPending;
+	MemoryContext scanCtx;
+
 	/* Find by AddInfo */
 	bool		useMarkAddInfo;
 	RumItem		markAddInfo;

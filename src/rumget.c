@@ -138,6 +138,12 @@ callAddInfoConsistentFn(RumState * rumstate, RumScanKey key)
 	return res;
 }
 
+static void ensureEntryListLoaded(RumState * rumstate, RumScanEntry entry);
+static void entryGetItem(RumState * rumstate, RumScanEntry entry,
+			 bool *nextEntryList, Snapshot snapshot);
+static void entryFindItem(RumState * rumstate, RumScanEntry entry,
+			  RumItem * item, Snapshot snapshot);
+
 /*
  * Convenience function for invoking a key's consistentFn
  */
@@ -560,6 +566,8 @@ restartScanEntry:
 	entry->matchSortstate = NULL;
 	entry->reduceResult = false;
 	entry->predictNumberResult = 0;
+	entry->listPending = false;
+	entry->scanCtx = CurrentMemoryContext;
 
 	/*
 	 * we should find entry, and begin scan of posting tree or just store
@@ -663,43 +671,22 @@ restartScanEntry:
 			entry->predictNumberResult = gdi->stack->predictNumber * RumPageGetOpaque(page)->maxoff;
 
 			/*
-			 * Copy page content into memory so we can unlock the buffer.
-			 * Allocate enough space for any leaf page: maxoff can never
-			 * exceed BLCKSZ, so BLCKSZ * sizeof(RumItem) is a safe upper
-			 * bound.  The buffer is reused by entryGetNextItem() when
-			 * traversing to subsequent pages of the posting tree.
+			 * Defer copying the leaf page into memory until the entry
+			 * is first read: an eager copy costs a BLCKSZ-sized
+			 * allocation plus a full page decode per entry, which is
+			 * wasted whenever the scan never reads that far.  The buffer
+			 * stays pinned exactly as after an eager copy, which keeps
+			 * vacuum away from the page; ensureEntryListLoaded() decodes
+			 * it under a fresh share lock on first access.
 			 */
-			entry->list = (RumItem *) palloc(BLCKSZ * sizeof(RumItem));
-			maxoff = RumPageGetOpaque(page)->maxoff;
-			entry->nlist = maxoff;
-
-			ptr = RumDataPageGetData(page);
-
-			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-			{
-				ptr = rumDataPageLeafRead(ptr, entry->attnum, &item, true,
-										  rumstate);
-				entry->list[i - FirstOffsetNumber] = item;
-			}
+			(void) maxoff;
+			(void) ptr;
+			(void) item;
+			(void) i;
+			entry->listPending = true;
+			entry->isFinished = false;
 
 			LockBuffer(entry->buffer, RUM_UNLOCK);
-
-			/*
-			 * If the current page is empty (nlist == 0), we cannot assume the
-			 * scan is complete, as subsequent pages may exist.  Therefore, we
-			 * set isFinished = false and leave entry->nlist = 0 and
-			 * entry->offset = 0 to ensure that entryGetItem advances to the
-			 * next page on the next call.  Otherwise, initialize curItem to
-			 * the first valid item.
-			 */
-			if (entry->nlist == 0)
-				entry->isFinished = false;
-			else
-			{
-				entry->isFinished = setListPositionScanEntry(rumstate, entry);
-				if (!entry->isFinished)
-					entry->curItem = entry->list[entry->offset];
-			}
 		}
 		else if (RumGetNPosting(itup) > 0)
 		{
@@ -1144,6 +1131,8 @@ entryGetNextItemList(RumState * rumstate, RumScanEntry entry, Snapshot snapshot)
 	entry->matchSortstate = NULL;
 	entry->reduceResult = false;
 	entry->predictNumberResult = 0;
+	entry->listPending = false;
+	entry->scanCtx = CurrentMemoryContext;
 	entry->buffer = InvalidBuffer;
 	entry->offset = InvalidOffsetNumber;
 	RumItemSetMin(&entry->curItem);
@@ -1312,10 +1301,62 @@ entryGetNextItemList(RumState * rumstate, RumScanEntry entry, Snapshot snapshot)
  *
  * Item pointers must be returned in ascending order.
  */
+/*
+ * Decode the pinned leftmost leaf page of a posting-tree entry whose copy
+ * was deferred by startScanEntry.  Reproduces the eager tail exactly:
+ * position at the first item per scan direction, or leave an empty page to
+ * be advanced past by entryGetItem.
+ */
+static void
+ensureEntryListLoaded(RumState * rumstate, RumScanEntry entry)
+{
+	Page		page;
+	OffsetNumber maxoff,
+				i;
+	Pointer		ptr;
+	RumItem		item;
+
+	if (!entry->listPending)
+		return;
+	entry->listPending = false;
+
+	/* varbyte decoding is delta-based: start from the minimal item */
+	RumItemSetMin(&item);
+
+	LockBuffer(entry->buffer, RUM_SHARE);
+	page = BufferGetPage(entry->buffer);
+
+	entry->list = (RumItem *)
+		MemoryContextAlloc(entry->scanCtx, BLCKSZ * sizeof(RumItem));
+	maxoff = RumPageGetOpaque(page)->maxoff;
+	entry->nlist = maxoff;
+
+	ptr = RumDataPageGetData(page);
+
+	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+	{
+		ptr = rumDataPageLeafRead(ptr, entry->attnum, &item, true, rumstate);
+		entry->list[i - FirstOffsetNumber] = item;
+	}
+
+	LockBuffer(entry->buffer, RUM_UNLOCK);
+
+	if (entry->nlist == 0)
+		entry->isFinished = false;
+	else
+	{
+		entry->isFinished = setListPositionScanEntry(rumstate, entry);
+		if (!entry->isFinished)
+			entry->curItem = entry->list[entry->offset];
+	}
+}
+
 static void
 entryGetItem(RumState * rumstate, RumScanEntry entry, bool *nextEntryList, Snapshot snapshot)
 {
 	Assert(!entry->isFinished);
+
+	ensureEntryListLoaded(rumstate, entry);
 
 	if (nextEntryList)
 		*nextEntryList = false;
@@ -2078,6 +2119,8 @@ end:
 static void
 entryFindItem(RumState * rumstate, RumScanEntry entry, RumItem * item, Snapshot snapshot)
 {
+	ensureEntryListLoaded(rumstate, entry);
+
 	if (entry->nlist == 0)
 	{
 		entry->isFinished = true;
