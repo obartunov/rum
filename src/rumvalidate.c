@@ -206,6 +206,11 @@ rumvalidate(Oid opclassoid)
 											opcintype_overload, opcintype_overload,
 											INT2OID);
 				break;
+			case RUM_QUERY_MIN_MATCHES_PROC:
+				ok = check_amproc_signature(procform->amproc, INT4OID, false,
+											3, 3, opcintype, INT2OID,
+											INT4OID);
+				break;
 			case RUM_ADDINFO_JOIN:
 				ok = check_amproc_signature(procform->amproc, BYTEAOID, false,
 											2, 2, INTERNALOID, INTERNALOID);

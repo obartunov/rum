@@ -731,6 +731,24 @@ startScanKey(RumState * rumstate, RumScanKey key)
 	key->curItemMatches = false;
 	key->recheckCurItem = false;
 	key->isFinished = false;
+
+	/*
+	 * Ask the opclass for the minimal number of matched entries required by
+	 * consistent, if it can tell.  Called once per scan; the result lets the
+	 * fast scan replace the per-step preConsistent fmgr call with an integer
+	 * comparison.
+	 */
+	key->minMatches = -1;
+	if (!key->orderBy &&
+		key->searchMode != GIN_SEARCH_MODE_EVERYTHING &&
+		key->nuserentries > 0 &&
+		rumstate->canQueryMinMatches[key->attnum - 1])
+		key->minMatches = DatumGetInt32(FunctionCall3Coll(
+							&rumstate->queryMinMatchesFn[key->attnum - 1],
+							rumstate->supportCollation[key->attnum - 1],
+							key->query,
+							UInt16GetDatum(key->strategy),
+							Int32GetDatum(key->nuserentries)));
 }
 
 /*
@@ -874,8 +892,9 @@ startScan(IndexScanDesc scan)
 			scanType = RumFullScan;
 			break;
 		}
-		/* Else check keys for preConsistent method */
-		else if (!so->rumstate.canPreConsistent[key->attnum - 1])
+		/* Else check keys for preConsistent or counting method */
+		else if (!so->rumstate.canPreConsistent[key->attnum - 1] &&
+				 key->minMatches < 0)
 		{
 			scanType = RumRegularScan;
 			break;
@@ -2239,6 +2258,28 @@ preConsistentCheck(RumScanOpaque so)
 
 		if (key->searchMode == GIN_SEARCH_MODE_EVERYTHING)
 			continue;
+
+		/*
+		 * Counting mode: consistent can succeed only if at least
+		 * key->minMatches entries are still potentially true.  Integer
+		 * arithmetic instead of an fmgr call per frontier step.
+		 *
+		 * minMatches was computed from nuserentries, while we count over
+		 * all nentries; extra non-user entries can only inflate maxtrue,
+		 * which weakens pruning but can never reject a valid match.
+		 */
+		if (key->minMatches >= 0)
+		{
+			int32		maxtrue = 0;
+
+			for (i = 0; i < key->nentries; i++)
+				if (key->scanEntry[i]->preValue)
+					maxtrue++;
+
+			if (maxtrue < key->minMatches)
+				return false;
+			continue;
+		}
 
 		if (!so->rumstate.canPreConsistent[key->attnum - 1])
 			continue;

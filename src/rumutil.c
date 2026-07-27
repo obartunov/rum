@@ -391,6 +391,22 @@ initRumState(RumState * state, Relation index)
 		}
 
 		/*
+		 * Check opclass capability to report the minimum number of matched
+		 * entries required by consistent (counting-mode fast scan).
+		 */
+		if (index_getprocid(index, i + 1, RUM_QUERY_MIN_MATCHES_PROC) != InvalidOid)
+		{
+			fmgr_info_copy(&(state->queryMinMatchesFn[i]),
+					index_getprocinfo(index, i + 1, RUM_QUERY_MIN_MATCHES_PROC),
+						   CurrentMemoryContext);
+			state->canQueryMinMatches[i] = true;
+		}
+		else
+		{
+			state->canQueryMinMatches[i] = false;
+		}
+
+		/*
 		 * Check opclass capability to do order by.
 		 */
 		if (index_getprocid(index, i + 1, RUM_ORDERING_PROC) != InvalidOid)

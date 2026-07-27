@@ -397,6 +397,9 @@ typedef struct RumState
 	bool		canPartialMatch[INDEX_MAX_KEYS];
 	/* canPreConsistent[i] is true if preConsistentFn[i] is valid */
 	bool		canPreConsistent[INDEX_MAX_KEYS];
+	/* optional: returns min number of matched entries required by consistent */
+	FmgrInfo	queryMinMatchesFn[INDEX_MAX_KEYS];
+	bool		canQueryMinMatches[INDEX_MAX_KEYS];
 	/* canOrdering[i] is true if orderingFn[i] is valid */
 	bool		canOrdering[INDEX_MAX_KEYS];
 	bool		canOuterOrdering[INDEX_MAX_KEYS];
@@ -643,6 +646,13 @@ typedef struct RumScanKeyData
 	OffsetNumber attnumOrig;
 
 	/*
+	 * Counting-mode fast scan: minimum number of matched entries required
+	 * for consistent to possibly succeed; -1 if not applicable.  Computed
+	 * once per scan from RUM_QUERY_MIN_MATCHES_PROC.
+	 */
+	int32		minMatches;
+
+	/*
 	 * Match status data.  curItem is the TID most recently tested (could be a
 	 * lossy-page pointer).  curItemMatches is TRUE if it passes the
 	 * consistentFn test; if so, recheckCurItem is the recheck flag.
@@ -860,7 +870,18 @@ extern RumItem *rumGetBAEntry(BuildAccumulator *accum,
 #define RUM_ORDERING_PROC			8
 #define RUM_OUTER_ORDERING_PROC		9
 #define RUM_ADDINFO_JOIN			10
-#define RUMNProcs					10
+/*
+ * RUM_QUERY_MIN_MATCHES_PROC(query, strategy, nentries) -> int4
+ *
+ * The query-level lower bound: the least number of query entries a
+ * matching row must contain, computed from the query alone.  Invariant:
+ *
+ *		0 <= query_min <= nentries
+ *
+ * Returning 0 disables the bound for this key.
+ */
+#define RUM_QUERY_MIN_MATCHES_PROC		11
+#define RUMNProcs					11
 
 #define LOWERMASK 0x1F
 
