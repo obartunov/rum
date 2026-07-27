@@ -407,6 +407,22 @@ initRumState(RumState * state, Relation index)
 		}
 
 		/*
+		 * Check opclass capability to report the exact per-candidate bound
+		 * from the document's addInfo.
+		 */
+		if (index_getprocid(index, i + 1, RUM_CANDIDATE_MIN_MATCHES_PROC) != InvalidOid)
+		{
+			fmgr_info_copy(&(state->candMinMatchesFn[i]),
+					index_getprocinfo(index, i + 1, RUM_CANDIDATE_MIN_MATCHES_PROC),
+						   CurrentMemoryContext);
+			state->canCandMinMatches[i] = true;
+		}
+		else
+		{
+			state->canCandMinMatches[i] = false;
+		}
+
+		/*
 		 * Check opclass capability to do order by.
 		 */
 		if (index_getprocid(index, i + 1, RUM_ORDERING_PROC) != InvalidOid)

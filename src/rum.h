@@ -400,6 +400,9 @@ typedef struct RumState
 	/* optional: returns min number of matched entries required by consistent */
 	FmgrInfo	queryMinMatchesFn[INDEX_MAX_KEYS];
 	bool		canQueryMinMatches[INDEX_MAX_KEYS];
+	/* optional: per-candidate exact bound from document-level addInfo */
+	FmgrInfo	candMinMatchesFn[INDEX_MAX_KEYS];
+	bool		canCandMinMatches[INDEX_MAX_KEYS];
 	/* canOrdering[i] is true if orderingFn[i] is valid */
 	bool		canOrdering[INDEX_MAX_KEYS];
 	bool		canOuterOrdering[INDEX_MAX_KEYS];
@@ -782,6 +785,15 @@ typedef struct RumCountingScanState
 								 * candidate; deferred so keyGetOrdering
 								 * sees positions at the emitted TID */
 	RumItem		pending;
+
+	/*
+	 * Memoized per-candidate bound: candMdValid means candMd is the
+	 * RUM_CANDIDATE_MIN_MATCHES_PROC result for a document whose addInfo
+	 * equals candD.  Valid only for by-value addInfo types.
+	 */
+	bool		candMdValid;
+	Datum		candD;
+	int32		candMd;
 } RumCountingScanState;
 
 typedef struct RumScanOpaqueData
@@ -917,7 +929,27 @@ extern RumItem *rumGetBAEntry(BuildAccumulator *accum,
  * Returning 0 disables the bound for this key.
  */
 #define RUM_QUERY_MIN_MATCHES_PROC		11
-#define RUMNProcs					11
+
+/*
+ * RUM_CANDIDATE_MIN_MATCHES_PROC(query, strategy, nentries, addInfo) -> int4
+ *
+ * Refines the query-level bound for one candidate row, given the addInfo
+ * of the posting that produced it.  Invariants:
+ *
+ *		query_min <= candidate_min <= nentries
+ *
+ * and the result must depend only on the query, the strategy, nentries
+ * and that addInfo, since RUM memoizes it per distinct addInfo value
+ * within a scan.
+ *
+ * If this procedure is defined, the addInfo the opclass stores must
+ * represent the same document-level property for all entries generated
+ * from one indexed value: the value seen here comes from whichever
+ * posting happened to produce the candidate.  The addInfo type must also
+ * be passed by value, or the memoization would compare pointers.
+ */
+#define RUM_CANDIDATE_MIN_MATCHES_PROC	12
+#define RUMNProcs					12
 
 #define LOWERMASK 0x1F
 

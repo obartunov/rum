@@ -1088,6 +1088,7 @@ startScan(IndexScanDesc scan)
 					entryGetItem(&so->rumstate, so->sortedEntries[i], NULL,
 								 scan->xs_snapshot);
 			}
+			cs->candMdValid = false;
 		}
 	}
 
@@ -2515,6 +2516,9 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 	RumScanKey	key = cs->key;
 	uint32		nRare = cs->nRare;
 	uint32		needed = (uint32) key->minMatches;
+	uint32		required;
+	Datum		docAddInfo;
+	bool		docAddInfoValid;
 	int			i;
 
 	for (;;)
@@ -2564,8 +2568,10 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 
 		candidate = minEntry->curItem;
 
-		/* Count rare matches at the candidate */
+		/* Count rare matches at the candidate; grab the document addInfo */
 		matched = 0;
+		docAddInfo = (Datum) 0;
+		docAddInfoValid = false;
 		for (i = 0; i < (int) nRare; i++)
 		{
 			RumScanEntry entry = so->sortedEntries[i];
@@ -2573,8 +2579,53 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 			if (!entry->isFinished &&
 				rumCompareItemPointers(&entry->curItem.iptr,
 									   &candidate.iptr) == 0)
+			{
 				matched++;
+				if (!docAddInfoValid && !entry->curItem.addInfoIsNull)
+				{
+					docAddInfo = entry->curItem.addInfo;
+					docAddInfoValid = true;
+				}
+			}
 		}
+
+		/*
+		 * Document-specific exact bound: with the document's addInfo in
+		 * hand, the opclass can name the exact minimal number of matched
+		 * entries this particular document needs.  Since it is at least
+		 * the query-level bound, we only tighten `required`.  Memoized on
+		 * the addInfo value: within one scan the query and the threshold
+		 * are fixed, so equal addInfo yields an equal bound.
+		 */
+		required = needed;
+		if (docAddInfoValid &&
+			rumstate->canCandMinMatches[key->attnum - 1])
+		{
+			bool		addInfoByVal =
+				so->rumstate.addAttrs[key->attnum - 1] == NULL ||
+				so->rumstate.addAttrs[key->attnum - 1]->attbyval;
+
+			/*
+			 * Memoize only for by-value addInfo: for by-ref types Datum
+			 * equality would compare pointers, and a reused allocation
+			 * could produce a false hit.
+			 */
+			if (!(addInfoByVal && cs->candMdValid && cs->candD == docAddInfo))
+			{
+				cs->candMd = DatumGetInt32(FunctionCall4Coll(
+							&rumstate->candMinMatchesFn[key->attnum - 1],
+							rumstate->supportCollation[key->attnum - 1],
+							key->query,
+							UInt16GetDatum(key->strategy),
+							Int32GetDatum(key->nuserentries),
+							docAddInfo));
+				cs->candD = docAddInfo;
+				cs->candMdValid = true;
+			}
+			if (cs->candMd > (int32) required)
+				required = (uint32) cs->candMd;
+		}
+
 
 		/*
 		 * Probe frequent entries, least frequent first, with early
@@ -2585,7 +2636,7 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 			RumScanEntry entry = so->sortedEntries[i];
 			uint32		remaining = key->nentries - i;
 
-			if (matched + remaining < needed)
+			if (matched + remaining < required)
 				break;			/* cannot reach the bound: reject */
 
 			/*
@@ -2611,7 +2662,7 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 		emit = false;
 		*recheck = false;
 
-		if (matched >= needed)
+		if (matched >= required)
 		{
 			int			j;
 
