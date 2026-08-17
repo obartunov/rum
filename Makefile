@@ -1,20 +1,22 @@
 # contrib/rum/Makefile
 
 MODULE_big = rum
-EXTENSION = rum
+EXTENSION = rum rum_trgm
 EXTVERSION = 1.4
 PGFILEDESC = "RUM index access method"
 
 OBJS = src/rumtidbitmap.o src/rumsort.o src/rum_ts_utils.o src/rumtsquery.o \
+	src/rum_trgm.o \
 	src/rumbtree.o src/rumbulk.o src/rumdatapage.o \
 	src/rumentrypage.o src/rumget.o src/ruminsert.o \
 	src/rumscan.o src/rumutil.o src/rumvacuum.o src/rumvalidate.o \
 	src/btree_rum.o src/rum_arr_utils.o src/rum_debug_funcs.o $(WIN32RES)
 
-DATA = rum--1.0--1.1.sql rum--1.1--1.2.sql \
+DATA = rum_trgm--1.0.sql \
+	rum--1.0--1.1.sql rum--1.1--1.2.sql \
 	rum--1.2--1.3.sql rum--1.3--1.4.sql
 
-DATA_built = $(EXTENSION)--$(EXTVERSION).sql
+DATA_built = rum--$(EXTVERSION).sql
 
 INCLUDES = rum.h rumsort.h rumtidbitmap.h
 RELATIVE_INCLUDES = $(addprefix src/, $(INCLUDES))
@@ -45,7 +47,7 @@ include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
 
-$(EXTENSION)--$(EXTVERSION).sql: rum_init.sql
+rum--$(EXTVERSION).sql: rum_init.sql
 	cat $^ > $@
 
 #

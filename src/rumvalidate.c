@@ -15,6 +15,8 @@
 #include "access/amvalidate.h"
 #include "access/htup_details.h"
 #include "catalog/pg_amop.h"
+#include "catalog/pg_proc.h"
+#include "parser/parse_coerce.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
@@ -162,11 +164,24 @@ rumvalidate(Oid opclassoid)
 												INTERNALOID, INTERNALOID,
 												INTERNALOID, INTERNALOID);
 				else
+				{
+					/*
+					 * Generic opclasses declare the query argument as
+					 * internal; one whose query is of the indexed type may
+					 * declare it as that type instead.
+					 */
 					ok = check_amproc_signature(procform->amproc, BOOLOID, false,
 												6, 8, INTERNALOID, INT2OID,
 												INTERNALOID, INT4OID,
 												INTERNALOID, INTERNALOID,
 												INTERNALOID, INTERNALOID);
+					if (!ok)
+						ok = check_amproc_signature(procform->amproc, BOOLOID, false,
+													6, 8, INTERNALOID, INT2OID,
+													opcintype_overload, INT4OID,
+													INTERNALOID, INTERNALOID,
+													INTERNALOID, INTERNALOID);
+				}
 				break;
 			case GIN_COMPARE_PARTIAL_PROC:
 				ok = check_amproc_signature(procform->amproc, INT4OID, false,
@@ -186,16 +201,19 @@ rumvalidate(Oid opclassoid)
 											INTERNALOID, INTERNALOID);
 				break;
 			case RUM_ORDERING_PROC:
-				/* Two possible signatures */
-				if (opcintype == TSVECTOROID ||
-					opcintype == ANYARRAYOID)
-					ok = check_amproc_signature(procform->amproc, FLOAT8OID, false,
-												9, 9, INTERNALOID, INT2OID,
-												opcintype, INT4OID,
-												INTERNALOID, INTERNALOID,
-												INTERNALOID, INTERNALOID,
-												INTERNALOID, INTERNALOID);
-				else
+
+				/*
+				 * Either the entry-level form, which receives the check
+				 * vector and per-entry addInfo, or the value-level form
+				 * computing the distance from the two values directly.
+				 */
+				ok = check_amproc_signature(procform->amproc, FLOAT8OID, false,
+											9, 9, INTERNALOID, INT2OID,
+											opcintype_overload, INT4OID,
+											INTERNALOID, INTERNALOID,
+											INTERNALOID, INTERNALOID,
+											INTERNALOID, INTERNALOID);
+				if (!ok)
 					ok = check_amproc_signature(procform->amproc, FLOAT8OID, false,
 												3, 3,
 												opcintype, opcintype, INT2OID);
@@ -212,9 +230,33 @@ rumvalidate(Oid opclassoid)
 											INT4OID);
 				break;
 			case RUM_CANDIDATE_MIN_MATCHES_PROC:
-				ok = check_amproc_signature(procform->amproc, INT4OID, false,
-											4, 4, opcintype, INT2OID,
-											INT4OID, INTERNALOID);
+
+				/*
+				 * (query, strategy, nentries, addInfo) -> int4.  The addInfo
+				 * type is whatever the opclass declares in its config
+				 * function, so only the first three arguments and the result
+				 * can be checked here.
+				 */
+				{
+					HeapTuple	candtup;
+					Form_pg_proc pp;
+
+					candtup = SearchSysCache1(PROCOID,
+											  ObjectIdGetDatum(procform->amproc));
+					if (!HeapTupleIsValid(candtup))
+						elog(ERROR, "cache lookup failed for function %u",
+							 procform->amproc);
+					pp = (Form_pg_proc) GETSTRUCT(candtup);
+
+					ok = (pp->prorettype == INT4OID &&
+						  !pp->proretset &&
+						  pp->pronargs == 4 &&
+						  IsBinaryCoercible(opcintype, pp->proargtypes.values[0]) &&
+						  pp->proargtypes.values[1] == INT2OID &&
+						  pp->proargtypes.values[2] == INT4OID);
+
+					ReleaseSysCache(candtup);
+				}
 				break;
 			case RUM_ADDINFO_JOIN:
 				ok = check_amproc_signature(procform->amproc, BYTEAOID, false,
@@ -277,9 +319,12 @@ rumvalidate(Oid opclassoid)
 								format_operator(oprform->amopopr))));
 				result = false;
 			}
-			/* other types distance returns float8 */
+			/* other types return float8, or float4 as pg_trgm's <-> does */
 			else if (oprform->amoplefttype != TSVECTOROID &&
 					 !check_amop_signature(oprform->amopopr, FLOAT8OID,
+										   oprform->amoplefttype,
+										   oprform->amoprighttype) &&
+					 !check_amop_signature(oprform->amopopr, FLOAT4OID,
 										   oprform->amoplefttype,
 										   oprform->amoprighttype))
 			{

@@ -1,0 +1,6 @@
+# rum_trgm extension
+comment = 'RUM index support for trigram similarity search over text'
+default_version = '1.0'
+module_pathname = '$libdir/rum'
+relocatable = true
+requires = 'rum,pg_trgm'
