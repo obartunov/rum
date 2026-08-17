@@ -139,6 +139,7 @@ callAddInfoConsistentFn(RumState * rumstate, RumScanKey key)
 }
 
 static void ensureEntryListLoaded(RumState * rumstate, RumScanEntry entry);
+static int counting_entry_freq_cmp(const void *p1, const void *p2, void *arg);
 static void entryGetItem(RumState * rumstate, RumScanEntry entry,
 			 bool *nextEntryList, Snapshot snapshot);
 static void entryFindItem(RumState * rumstate, RumScanEntry entry,
@@ -953,6 +954,60 @@ startScan(IndexScanDesc scan)
 
 	ItemPointerSetInvalid(&so->item.iptr);
 
+	/*
+	 * Try to upgrade an eligible fast scan to a counting (DivideSkip) scan:
+	 * merge only the nentries - (m - 1) least frequent entries to produce
+	 * candidates and probe the m - 1 most frequent ones per candidate, where
+	 * m is the opclass-reported minimal number of matched entries.  Narrow
+	 * v0 conditions: exactly one search key, default search mode, forward
+	 * scan, plain entries, no alternative (addInfo) ordering.
+	 */
+	if (scanType == RumFastScan && !rumstate->useAlternativeOrder)
+	{
+		RumScanKey	searchKey = NULL;
+		int			nSearchKeys = 0;
+
+		for (i = 0; i < so->nkeys; i++)
+		{
+			if (!so->keys[i]->orderBy)
+			{
+				searchKey = so->keys[i];
+				nSearchKeys++;
+			}
+		}
+
+		if (nSearchKeys == 1 &&
+			searchKey->minMatches >= 2 &&
+			searchKey->searchMode == GIN_SEARCH_MODE_DEFAULT &&
+			searchKey->nentries == searchKey->nuserentries &&
+			searchKey->nentries >= searchKey->minMatches &&
+			ScanDirectionIsForward(searchKey->scanDirection))
+		{
+			bool		entriesOk = true;
+
+			for (i = 0; i < searchKey->nentries; i++)
+			{
+				RumScanEntry entry = searchKey->scanEntry[i];
+
+				if (entry->isPartialMatch || entry->scanWithAddInfo ||
+					entry->useMarkAddInfo ||
+					!ScanDirectionIsForward(entry->scanDirection))
+				{
+					entriesOk = false;
+					break;
+				}
+			}
+
+			if (entriesOk)
+			{
+				scanType = RumCountingScan;
+				so->countingState = (RumCountingScanState *)
+					palloc0(sizeof(RumCountingScanState));
+				so->countingState->key = searchKey;
+			}
+		}
+	}
+
 	if (scanType == RumFastScan)
 	{
 		/*
@@ -970,6 +1025,70 @@ startScan(IndexScanDesc scan)
 		}
 		qsort_arg(so->sortedEntries, so->totalentries, sizeof(RumScanEntry),
 				  scan_entry_cmp, rumstate);
+	}
+	else if (scanType == RumCountingScan)
+	{
+		so->sortedEntries = (RumScanEntry *) palloc(sizeof(RumScanEntry) *
+													so->totalentries);
+		{
+			/*
+			 * Counting scan: partition the search key's own entries by
+			 * ascending expected frequency; the m - 1 most frequent go to
+			 * the tail and are probed, the rest drive the merge.  Entries
+			 * of other keys (order-by duplicates: the strategy check in
+			 * rumFillScanEntry prevents merging them with search entries)
+			 * are collected separately and synced to the candidate on
+			 * emission, so keyGetOrdering sees correct positions.
+			 */
+			RumCountingScanState *cs = so->countingState;
+			RumScanKey	ckey = cs->key;
+			uint32		nsync = 0;
+			uint32		j;
+
+			memcpy(so->sortedEntries, ckey->scanEntry,
+				   sizeof(RumScanEntry) * ckey->nentries);
+			qsort_arg(so->sortedEntries, ckey->nentries, sizeof(RumScanEntry),
+					  counting_entry_freq_cmp, rumstate);
+			cs->nRare = ckey->nentries - ckey->minMatches + 1;
+
+			cs->roles = (RumEntryScanRole *)
+				palloc(sizeof(RumEntryScanRole) * ckey->nentries);
+			for (i = 0; i < ckey->nentries; i++)
+				cs->roles[i] = (i < cs->nRare) ? RUM_ENTRY_GENERATOR
+											   : RUM_ENTRY_PROBE;
+
+			cs->sync = (RumScanEntry *)
+				palloc(sizeof(RumScanEntry) * so->totalentries);
+			for (i = 0; i < so->totalentries; i++)
+			{
+				bool		own = false;
+
+				for (j = 0; j < ckey->nentries; j++)
+				{
+					if (so->entries[i] == ckey->scanEntry[j])
+					{
+						own = true;
+						break;
+					}
+				}
+				if (!own)
+					cs->sync[nsync++] = so->entries[i];
+			}
+			cs->nSync = nsync;
+			cs->pendingValid = false;
+
+			/*
+			 * Prime only the generator entries: probe and sync entries are
+			 * read lazily on first seek, so their deferred first pages are
+			 * never decoded unless a candidate actually needs them.
+			 */
+			for (i = 0; i < cs->nRare; i++)
+			{
+				if (!so->sortedEntries[i]->isFinished)
+					entryGetItem(&so->rumstate, so->sortedEntries[i], NULL,
+								 scan->xs_snapshot);
+			}
+		}
 	}
 
 	so->scanType = scanType;
@@ -2361,6 +2480,210 @@ entryShift(int i, RumScanOpaque so, bool find, Snapshot snapshot)
 }
 
 /*
+ * Comparator: ascending expected posting size (counting scan partition).
+ */
+static int
+counting_entry_freq_cmp(const void *p1, const void *p2, void *arg)
+{
+	const RumScanEntry e1 = *((RumScanEntry const *) p1);
+	const RumScanEntry e2 = *((RumScanEntry const *) p2);
+
+	if (e1->predictNumberResult < e2->predictNumberResult)
+		return -1;
+	if (e1->predictNumberResult > e2->predictNumberResult)
+		return 1;
+	return 0;
+}
+
+/*
+ * Get next item pointer using counting (DivideSkip) scan.
+ *
+ * sortedEntries[0 .. nRare) — the rare set R — are merged in TID
+ * order and generate candidates; a TID can pass consistent only if it
+ * matches at least minMatches entries, and since |H| = minMatches - 1,
+ * every such TID matches at least one entry of R.  The frequent set H is
+ * probed per candidate with entryFindItem, which resolves within the
+ * already-loaded page in the common (dense posting) case.
+ */
+static bool
+scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
+					RumItem *item, bool *recheck)
+{
+	RumScanOpaque so = (RumScanOpaque) scan->opaque;
+	RumState   *rumstate = &so->rumstate;
+	RumCountingScanState *cs = so->countingState;
+	RumScanKey	key = cs->key;
+	uint32		nRare = cs->nRare;
+	uint32		needed = (uint32) key->minMatches;
+	int			i;
+
+	for (;;)
+	{
+		RumScanEntry minEntry = NULL;
+		RumItem		candidate;
+		uint32		matched;
+		bool		emit;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Advance rare entries left standing at the previously emitted
+		 * candidate.  Deferred from the previous call so that
+		 * keyGetOrdering, which runs after we return, sees entry positions
+		 * at the emitted TID.
+		 */
+		if (cs->pendingValid)
+		{
+			for (i = 0; i < (int) nRare; i++)
+			{
+				RumScanEntry entry = so->sortedEntries[i];
+
+				if (!entry->isFinished &&
+					rumCompareItemPointers(&entry->curItem.iptr,
+										   &cs->pending.iptr) == 0)
+					entryGetItem(rumstate, entry, NULL, scan->xs_snapshot);
+			}
+			cs->pendingValid = false;
+		}
+
+		/* Find the minimal current TID over unfinished rare entries */
+		for (i = 0; i < (int) nRare; i++)
+		{
+			RumScanEntry entry = so->sortedEntries[i];
+
+			if (entry->isFinished)
+				continue;
+			if (minEntry == NULL ||
+				rumCompareItemPointers(&entry->curItem.iptr,
+									   &minEntry->curItem.iptr) < 0)
+				minEntry = entry;
+		}
+
+		if (minEntry == NULL)
+			return false;		/* rare set exhausted — no more candidates */
+
+		candidate = minEntry->curItem;
+
+		/* Count rare matches at the candidate */
+		matched = 0;
+		for (i = 0; i < (int) nRare; i++)
+		{
+			RumScanEntry entry = so->sortedEntries[i];
+
+			if (!entry->isFinished &&
+				rumCompareItemPointers(&entry->curItem.iptr,
+									   &candidate.iptr) == 0)
+				matched++;
+		}
+
+		/*
+		 * Probe frequent entries, least frequent first, with early
+		 * rejection when the bound becomes unreachable.
+		 */
+		for (i = nRare; i < (int) key->nentries; i++)
+		{
+			RumScanEntry entry = so->sortedEntries[i];
+			uint32		remaining = key->nentries - i;
+
+			if (matched + remaining < needed)
+				break;			/* cannot reach the bound: reject */
+
+			/*
+			 * Seek forward only when the entry is strictly behind the
+			 * candidate: entryFindItem advances an entry that already
+			 * stands at or beyond the target (its early-return demands
+			 * curItem == list[offset], which does not hold after
+			 * entryGetItem), and that would lose a match standing exactly
+			 * at the candidate.
+			 */
+			if (!entry->isFinished &&
+				rumCompareItemPointers(&entry->curItem.iptr,
+									   &candidate.iptr) < 0)
+				entryFindItem(rumstate, entry, &candidate,
+							  scan->xs_snapshot);
+
+			if (!entry->isFinished &&
+				rumCompareItemPointers(&entry->curItem.iptr,
+									   &candidate.iptr) == 0)
+				matched++;
+		}
+
+		emit = false;
+		*recheck = false;
+
+		if (matched >= needed)
+		{
+			int			j;
+
+			for (j = 0; j < (int) key->nentries; j++)
+			{
+				RumScanEntry entry = key->scanEntry[j];
+
+				if (!entry->isFinished &&
+					rumCompareItemPointers(&entry->curItem.iptr,
+										   &candidate.iptr) == 0)
+				{
+					key->entryRes[j] = true;
+					key->addInfo[j] = entry->curItem.addInfo;
+					key->addInfoIsNull[j] = entry->curItem.addInfoIsNull;
+				}
+				else
+				{
+					key->entryRes[j] = false;
+					key->addInfo[j] = (Datum) 0;
+					key->addInfoIsNull[j] = true;
+				}
+			}
+
+			if (callConsistentFn(rumstate, key))
+			{
+				emit = true;
+				if (key->recheckCurItem)
+					*recheck = true;
+			}
+		}
+
+		if (emit)
+		{
+			uint32		s;
+
+			/*
+			 * Bring entries outside the search key (order-by duplicates)
+			 * to the candidate so keyGetOrdering computes the distance
+			 * from correct positions.
+			 */
+			for (s = 0; s < cs->nSync; s++)
+			{
+				RumScanEntry entry = cs->sync[s];
+
+				if (!entry->isFinished &&
+					rumCompareItemPointers(&entry->curItem.iptr,
+										   &candidate.iptr) < 0)
+					entryFindItem(rumstate, entry, &candidate,
+								  scan->xs_snapshot);
+			}
+
+			cs->pending = candidate;
+			cs->pendingValid = true;
+
+			*item = candidate;
+			return true;
+		}
+
+		/* Rejected: advance rare entries standing at the candidate now */
+		for (i = 0; i < (int) nRare; i++)
+		{
+			RumScanEntry entry = so->sortedEntries[i];
+
+			if (!entry->isFinished &&
+				rumCompareItemPointers(&entry->curItem.iptr,
+									   &candidate.iptr) == 0)
+				entryGetItem(rumstate, entry, NULL, scan->xs_snapshot);
+		}
+	}
+}
+
+/*
  * Get next item pointer using fast scan.
  */
 static bool
@@ -2563,6 +2886,8 @@ scanGetItem(IndexScanDesc scan, RumItem *advancePast,
 
 	if (so->scanType == RumFastScan)
 		return scanGetItemFast(scan, advancePast, item, recheck);
+	else if (so->scanType == RumCountingScan)
+		return scanGetItemCounting(scan, advancePast, item, recheck);
 	else if (so->scanType == RumFullScan)
 		return scanGetItemFull(scan, advancePast, item, recheck);
 	else

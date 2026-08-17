@@ -746,8 +746,43 @@ typedef enum
 {
 	RumFastScan,
 	RumRegularScan,
-	RumFullScan
+	RumFullScan,
+	RumCountingScan
 }	RumScanType;
+
+/*
+ * Entry roles of a candidate-generating scan.  Generators are the
+ * nentries - (K - 1) least frequent entries of the search key: their merge
+ * yields every possible candidate, because a row lacking all of them cannot
+ * reach K matches even if it contains the K - 1 withheld entries.  Probes
+ * are those withheld most frequent entries, sought per candidate only.
+ * Sync entries belong to other scan keys (order-by duplicates of the search
+ * key's entries) and are positioned at the candidate on emission so that
+ * keyGetOrdering sees consistent addInfo.
+ */
+typedef enum RumEntryScanRole
+{
+	RUM_ENTRY_GENERATOR,
+	RUM_ENTRY_PROBE,
+	RUM_ENTRY_SYNC
+} RumEntryScanRole;
+
+typedef struct RumCountingScanState
+{
+	RumScanKey	key;			/* the single search key of the scan */
+	uint32		nRare;			/* entries [0, nRare) of sortedEntries are
+								 * generators; [nRare, key->nentries) are
+								 * probes, ordered by ascending frequency */
+	RumEntryScanRole *roles;	/* role per sortedEntries slot, parallel to
+								 * the frequency-sorted prefix */
+	RumScanEntry *sync;			/* sync entries and their count */
+	uint32		nSync;
+	bool		pendingValid;	/* generators standing at pending must be
+								 * advanced before producing the next
+								 * candidate; deferred so keyGetOrdering
+								 * sees positions at the emitted TID */
+	RumItem		pending;
+} RumCountingScanState;
 
 typedef struct RumScanOpaqueData
 {
@@ -763,6 +798,7 @@ typedef struct RumScanOpaqueData
 	RumScanEntry *entries;			/* one per index search condition */
 	RumScanEntry *sortedEntries;	/* Sorted entries. Used in fast scan */
 	int			entriesIncrIndex;	/* used in fast scan */
+	RumCountingScanState *countingState;	/* NULL unless RumCountingScan */
 	uint32		totalentries;
 	uint32		allocentries;		/* allocated length of entries[] and
 									   sortedEntries[] */
