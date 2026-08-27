@@ -787,13 +787,15 @@ typedef struct RumCountingScanState
 	RumItem		pending;
 
 	/*
-	 * Memoized per-candidate bound: candMdValid means candMd is the
-	 * RUM_CANDIDATE_MIN_MATCHES_PROC result for a document whose addInfo
-	 * equals candD.  Valid only for by-value addInfo types.
+	 * Memoized per-candidate bounds, a direct-mapped cache keyed on the
+	 * by-value addInfo.  A single slot only helps while consecutive
+	 * candidates share a document size; with genuinely varying sizes it
+	 * thrashes and every candidate pays an fmgr call.
 	 */
-	bool		candMdValid;
-	Datum		candD;
-	int32		candMd;
+#define RUM_CAND_MEMO_SIZE 64
+	bool		candMemoValid[RUM_CAND_MEMO_SIZE];
+	Datum		candMemoD[RUM_CAND_MEMO_SIZE];
+	int32		candMemoMd[RUM_CAND_MEMO_SIZE];
 } RumCountingScanState;
 
 typedef struct RumScanOpaqueData

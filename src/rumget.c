@@ -1088,7 +1088,7 @@ startScan(IndexScanDesc scan)
 					entryGetItem(&so->rumstate, so->sortedEntries[i], NULL,
 								 scan->xs_snapshot);
 			}
-			cs->candMdValid = false;
+			memset(cs->candMemoValid, 0, sizeof(cs->candMemoValid));
 		}
 	}
 
@@ -2605,25 +2605,52 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 				so->rumstate.addAttrs[key->attnum - 1] == NULL ||
 				so->rumstate.addAttrs[key->attnum - 1]->attbyval;
 
+			int32		candMd;
+
 			/*
 			 * Memoize only for by-value addInfo: for by-ref types Datum
 			 * equality would compare pointers, and a reused allocation
-			 * could produce a false hit.
+			 * could produce a false hit.  The cache is direct-mapped on
+			 * the low bits of the value, which suits the addInfo domains
+			 * this procedure is defined for -- small integers such as a
+			 * document's term count.
 			 */
-			if (!(addInfoByVal && cs->candMdValid && cs->candD == docAddInfo))
+			if (addInfoByVal)
 			{
-				cs->candMd = DatumGetInt32(FunctionCall4Coll(
+				uint32		slot = ((uint32) DatumGetInt32(docAddInfo)) &
+					(RUM_CAND_MEMO_SIZE - 1);
+
+				if (cs->candMemoValid[slot] &&
+					cs->candMemoD[slot] == docAddInfo)
+				{
+					candMd = cs->candMemoMd[slot];
+				}
+				else
+				{
+					candMd = DatumGetInt32(FunctionCall4Coll(
+								&rumstate->candMinMatchesFn[key->attnum - 1],
+								rumstate->supportCollation[key->attnum - 1],
+								key->query,
+								UInt16GetDatum(key->strategy),
+								Int32GetDatum(key->nuserentries),
+								docAddInfo));
+					cs->candMemoD[slot] = docAddInfo;
+					cs->candMemoMd[slot] = candMd;
+					cs->candMemoValid[slot] = true;
+				}
+			}
+			else
+			{
+				candMd = DatumGetInt32(FunctionCall4Coll(
 							&rumstate->candMinMatchesFn[key->attnum - 1],
 							rumstate->supportCollation[key->attnum - 1],
 							key->query,
 							UInt16GetDatum(key->strategy),
 							Int32GetDatum(key->nuserentries),
 							docAddInfo));
-				cs->candD = docAddInfo;
-				cs->candMdValid = true;
 			}
-			if (cs->candMd > (int32) required)
-				required = (uint32) cs->candMd;
+			if (candMd > (int32) required)
+				required = (uint32) candMd;
 		}
 
 
