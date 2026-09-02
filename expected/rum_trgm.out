@@ -1,0 +1,89 @@
+-- rum_trgm_equivalence.sql
+\set ON_ERROR_STOP on
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS rum;
+NOTICE:  extension "rum" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS rum_trgm;
+CREATE OR REPLACE FUNCTION pg_temp.rum_trgm_show(text)
+RETURNS text[]
+AS '$libdir/rum', 'rum_trgm_show'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE TEMP TABLE trgm_cases(id int primary key, s text);
+INSERT INTO trgm_cases VALUES
+ (1,''),(2,'a'),(3,'ab'),(4,'abc'),(5,'hello world'),
+ (6,'PostgreSQL'),(7,'snake_case'),(8,'kebab-case'),(9,'a/b/c'),
+ (10,'foo@example.org'),(11,'Москва'),(12,'Καλημέρα'),(13,'東京'),
+ (14,'naïve café'),(15,E'one\t two\nthree'),(16,'  punctuation!!!  ');
+-- Equivalence is over the trigram SET, not the array order.  pg_trgm
+-- orders its output with signed or unsigned char comparison depending on
+-- GetDefaultCharSignedness(), a cluster property fixed at initdb time,
+-- while rum_trgm_cmp orders keys with memcmp, i.e. always unsigned.  The
+-- two therefore disagree on the position of trigrams containing bytes
+-- >= 0x80 while containing exactly the same trigrams.  Order carries no
+-- meaning here: RUM sorts entries with the opclass compare function, so
+-- what must match is the set.
+DO $$
+DECLARE r record;
+DECLARE pg_set text[];
+DECLARE rum_set text[];
+BEGIN
+  FOR r IN SELECT * FROM trgm_cases LOOP
+    SELECT array_agg(x ORDER BY x) INTO pg_set FROM unnest(show_trgm(r.s)) x;
+    SELECT array_agg(x ORDER BY x) INTO rum_set FROM unnest(pg_temp.rum_trgm_show(r.s)) x;
+    IF pg_set IS DISTINCT FROM rum_set THEN
+      RAISE EXCEPTION 'trigram mismatch id=% text=% pg=% rum=%',
+        r.id, r.s, pg_set, rum_set;
+    END IF;
+    IF array_length(show_trgm(r.s),1) IS DISTINCT FROM
+       array_length(pg_temp.rum_trgm_show(r.s),1) THEN
+      RAISE EXCEPTION 'trigram count mismatch id=% text=%', r.id, r.s;
+    END IF;
+  END LOOP;
+END $$;
+CREATE TEMP TABLE docs(id int primary key, body text);
+INSERT INTO docs
+SELECT g,
+       CASE g % 8
+         WHEN 0 THEN 'the patch does not apply to the current master branch'
+         WHEN 1 THEN 'the patch applies to master'
+         WHEN 2 THEN 'logical replication slot'
+         WHEN 3 THEN 'logical replicaton slot'
+         WHEN 4 THEN 'PostgreSQL trigram similarity search'
+         WHEN 5 THEN 'completely unrelated document'
+         WHEN 6 THEN 'русский текст и PostgreSQL'
+         ELSE 'foo bar baz quux'
+       END || ' ' || g
+FROM generate_series(1,5000) g;
+CREATE INDEX docs_rum_trgm ON docs USING rum (body rum_trgm_ops);
+ANALYZE docs;
+DO $$
+DECLARE t float8;
+DECLARE q text := 'the patch does not apply to current master';
+DECLARE bad int;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[0.05,0.15,0.30,0.50] LOOP
+    PERFORM set_config('pg_trgm.similarity_threshold',t::text,true);
+    SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; SET LOCAL enable_seqscan=on;
+    CREATE TEMP TABLE seq_ids ON COMMIT DROP AS SELECT id FROM docs WHERE body % q;
+    SET LOCAL enable_indexscan=on; SET LOCAL enable_bitmapscan=on; SET LOCAL enable_seqscan=off;
+    CREATE TEMP TABLE idx_ids ON COMMIT DROP AS SELECT id FROM docs WHERE body % q;
+    SELECT count(*) INTO bad FROM (
+      (SELECT id FROM seq_ids EXCEPT SELECT id FROM idx_ids)
+      UNION ALL
+      (SELECT id FROM idx_ids EXCEPT SELECT id FROM seq_ids)
+    ) x;
+    IF bad <> 0 THEN
+      RAISE EXCEPTION 'index/seqscan mismatch threshold %, differing ids %',t,bad;
+    END IF;
+    DROP TABLE seq_ids; DROP TABLE idx_ids;
+  END LOOP;
+END $$;
+SELECT count(*) AS distance_mismatches
+FROM docs
+WHERE abs((body <-> 'logical replication slot') -
+          (1.0-similarity(body,'logical replication slot'))) > 1e-6;
+ distance_mismatches 
+---------------------
+                   0
+(1 row)
+

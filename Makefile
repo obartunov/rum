@@ -23,7 +23,7 @@ RELATIVE_INCLUDES = $(addprefix src/, $(INCLUDES))
 
 LDFLAGS_SL += $(filter -lm, $(LIBS))
 
-REGRESS = security rum rum_validate rum_hash multicol ruminv timestamp \
+REGRESS = security rum rum_validate rum_hash multicol rum_trgm ruminv timestamp \
 	orderby orderby_hash altorder altorder_hash limits \
 	int2 int4 int8 float4 float8 money oid \
 	time timetz date interval \
