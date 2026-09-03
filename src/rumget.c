@@ -895,6 +895,42 @@ startScan(IndexScanDesc scan)
 		}
 	}
 
+	/*
+	 * The fast scan keeps all entries of the scan in one array ordered by
+	 * cmpEntries() and looks for the border where preConsistent() turns
+	 * false, treating the array as a single stream of positions.  That
+	 * ordering is only positional within one attribute: cmpEntries()
+	 * compares attnumOrig first and never looks at the item pointers when
+	 * the attributes differ.  With entries over several attributes the array
+	 * is therefore grouped by attribute, the border search mistakes the
+	 * attribute boundary for a position boundary, and the scan shifts the
+	 * wrong entries -- it walks one attribute's postings to exhaustion
+	 * while the other never advances, returning no rows or none at all.
+	 *
+	 * Use the regular scan in that case.  The test is over the entries the
+	 * fast scan will actually sort, not over the search keys: an order-by
+	 * key on another attribute contributes entries of its own and brings
+	 * the same breakage in through a query such as
+	 * WHERE t1 @@ q1 ORDER BY t2 <=> q2.
+	 */
+	if (scanType == RumFastScan)
+	{
+		OffsetNumber attnum = InvalidOffsetNumber;
+
+		for (i = 0; i < so->totalentries; i++)
+		{
+			RumScanEntry entry = so->entries[i];
+
+			if (attnum == InvalidOffsetNumber)
+				attnum = entry->attnumOrig;
+			else if (entry->attnumOrig != attnum)
+			{
+				scanType = RumRegularScan;
+				break;
+			}
+		}
+	}
+
 	if (scanType == RumFastScan)
 	{
 		for (i = 0; i < so->totalentries; i++)
