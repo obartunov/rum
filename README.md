@@ -1,458 +1,204 @@
-[![Build Status](https://api.travis-ci.com/postgrespro/rum.svg?branch=master)](https://travis-ci.com/postgrespro/rum)
-[![PGXN version](https://badge.fury.io/pg/rum.svg)](https://badge.fury.io/pg/rum)
-[![GitHub license](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](https://raw.githubusercontent.com/postgrespro/rum/master/LICENSE)
-
-[![Postgres Professional](img/PGpro-logo.svg)](https://postgrespro.com/)
-
-# RUM - RUM access method
-
-## Introduction
-
-The **rum** module provides access method to work with the `RUM` indexes. It is based
-on the `GIN` access method code.
-
-`GIN` index allows you to perform fast full-text search using `tsvector` and
-`tsquery` types. However, full-text search with `GIN` index has some performance
-issues because positional and other additional information is not stored.
-
-`RUM` solves these issues by storing additional information in a posting tree.
-As compared to `GIN`, `RUM` index has the following benefits:
-
-- Faster ranking. Ranking requires positional information. And after the
-index scan we do not need an additional heap scan to retrieve lexeme positions
-because `RUM` index stores them. 
-- Faster phrase search. This improvement is related to the previous one as
-phrase search also needs positional information.
-- Faster ordering by timestamp. `RUM` index stores additional information together
-with lexemes, so it is not necessary to perform a heap scan. 
-- A possibility to perform depth-first search and therefore return first
-results immediately. 
-
-You can get an idea of `RUM` with the following diagram:
-
-[![How RUM stores additional information](img/gin_rum.svg)](https://postgrespro.ru/docs/enterprise/current/rum?lang=en)
-
-The drawback of `RUM` is that it has slower build and insert time as compared to `GIN`
-This is because we need to store additional information besides keys and because
-because `RUM` stores additional information together with keys and uses generic WAL records.
-
-## License
-
-This module is available under the [license](LICENSE) similar to
-[PostgreSQL](http://www.postgresql.org/about/licence/).
-
-## Installation
-
-Before building and installing **rum**, you should ensure following are installed:
-
-* PostgreSQL version is 12+.
-
-* PostgreSQL 9.6 - 11  (but you need to transfer the `src/backend/nodes/tidbitmap.c` of the required version to the `contrib/rum/src/tidbitmap/tidbitmapXX.c` and include it to `contrib/rum/src/rumtidbitmap.c`)
-
-Typical installation procedure may look like this:
-
-### Using GitHub repository
-
-    $ git clone https://github.com/postgrespro/rum
-    $ cd rum
-    $ make USE_PGXS=1
-    $ make USE_PGXS=1 install
-    $ make USE_PGXS=1 installcheck
-    $ psql DB -c "CREATE EXTENSION rum;"
-
-### Using PGXN
-
-    $ USE_PGXS=1 pgxn install rum
-
-> **Important:** Don't forget to set the `PG_CONFIG` variable in case you want to test `RUM` on a custom build of PostgreSQL. Read more [here](https://wiki.postgresql.org/wiki/Building_and_Installing_PostgreSQL_Extension_Modules).
-
-## Tests
-
-$ make check
-
-This command runs:
-- regression tests;
-- isolation tests;
-- tap tests.
-
-    One of the tap tests downloads a 1GB archive and then unpacks it
-    into a file weighing almost 3GB. It is disabled by default.
-
-    To run this test, you need to set an environment variable:
-
-        $ export PG_TEST_EXTRA=big_values
-
-    The way to turn it off again:
-
-        $ export -n PG_TEST_EXTRA
-
-## Common operators and functions
-
-The **rum** module provides next operators.
-
-|       Operator       | Returns |                 Description
-| -------------------- | ------- | ----------------------------------------------
-| tsvector &lt;=&gt; tsquery | float4  | Returns distance between tsvector and tsquery.
-| timestamp &lt;=&gt; timestamp | float8 | Returns distance between two timestamps.
-| timestamp &lt;=&#124; timestamp | float8 | Returns distance only for left timestamps.
-| timestamp &#124;=&gt; timestamp | float8 | Returns distance only for right timestamps.
-
-The last three operations also work for types timestamptz, int2, int4, int8, float4, float8,
-money and oid.
-
-## Operator classes
-
-**rum** provides the following operator classes.
-
-### rum_tsvector_ops
-
-For type: `tsvector`
-
-This operator class stores `tsvector` lexemes with positional information. It supports
-ordering by the `<=>` operator and prefix search. See the example below.
-
-Let us assume we have the table:
-
-```sql
-CREATE TABLE test_rum(t text, a tsvector);
-
-CREATE TRIGGER tsvectorupdate
-BEFORE UPDATE OR INSERT ON test_rum
-FOR EACH ROW EXECUTE PROCEDURE tsvector_update_trigger('a', 'pg_catalog.english', 't');
-
-INSERT INTO test_rum(t) VALUES ('The situation is most beautiful');
-INSERT INTO test_rum(t) VALUES ('It is a beautiful');
-INSERT INTO test_rum(t) VALUES ('It looks like a beautiful place');
-```
-
-To create the **rum** index we need create an extension:
-
-```sql
-CREATE EXTENSION rum;
-```
-
-Then we can create new index:
-
-```sql
-CREATE INDEX rumidx ON test_rum USING rum (a rum_tsvector_ops);
-```
-
-And we can execute the following queries:
-
-```sql
-SELECT t, a <=> to_tsquery('english', 'beautiful | place') AS rank
-    FROM test_rum
-    WHERE a @@ to_tsquery('english', 'beautiful | place')
-    ORDER BY a <=> to_tsquery('english', 'beautiful | place');
-                t                |  rank
----------------------------------+---------
- It looks like a beautiful place | 8.22467
- The situation is most beautiful | 16.4493
- It is a beautiful               | 16.4493
-(3 rows)
-
-SELECT t, a <=> to_tsquery('english', 'place | situation') AS rank
-    FROM test_rum
-    WHERE a @@ to_tsquery('english', 'place | situation')
-    ORDER BY a <=> to_tsquery('english', 'place | situation');
-                t                |  rank
----------------------------------+---------
- The situation is most beautiful | 16.4493
- It looks like a beautiful place | 16.4493
-(2 rows)
-```
-
-### rum_tsvector_hash_ops
-
-For type: `tsvector`
-
-This operator class stores a hash of `tsvector` lexemes with positional information.
-It supports ordering by the `<=>` operator. It **doesn't** support prefix search.
-
-### rum_TYPE_ops
-
-For types: int2, int4, int8, float4, float8, money, oid, time, timetz, date,
-interval, macaddr, inet, cidr, text, varchar, char, bytea, bit, varbit,
-numeric, timestamp, timestamptz
-
-Supported operations: `<`, `<=`, `=`, `>=`, `>` for all types and
-`<=>`, `<=|` and `|=>` for int2, int4, int8, float4, float8, money, oid,
-timestamp and timestamptz types.
-
-This operator supports ordering by the `<=>`, `<=|` and `|=>` operators. It can be used with
-`rum_tsvector_addon_ops`, `rum_tsvector_hash_addon_ops` and `rum_anyarray_addon_ops` operator classes.
-
-### rum_tsvector_addon_ops
-
-For type: `tsvector`
-
-This operator class stores `tsvector` lexemes with any supported by module
-field. See the example below.
-
-Let us assume we have the table:
-
-```sql
-CREATE TABLE tsts (id int, t tsvector, d timestamp);
-
-\copy tsts from 'rum/data/tsts.data'
-
-CREATE INDEX tsts_idx ON tsts USING rum (t rum_tsvector_addon_ops, d)
-    WITH (attach = 'd', to = 't');
-```
-
-Now we can execute the following queries:
-```sql
-EXPLAIN (costs off)
-    SELECT id, d, d <=> '2016-05-16 14:21:25' FROM tsts WHERE t @@ 'wr&qh' ORDER BY d <=> '2016-05-16 14:21:25' LIMIT 5;
-                                    QUERY PLAN
------------------------------------------------------------------------------------
- Limit
-   ->  Index Scan using tsts_idx on tsts
-         Index Cond: (t @@ '''wr'' & ''qh'''::tsquery)
-         Order By: (d <=> 'Mon May 16 14:21:25 2016'::timestamp without time zone)
-(4 rows)
-
-SELECT id, d, d <=> '2016-05-16 14:21:25' FROM tsts WHERE t @@ 'wr&qh' ORDER BY d <=> '2016-05-16 14:21:25' LIMIT 5;
- id  |                d                |   ?column?
------+---------------------------------+---------------
- 355 | Mon May 16 14:21:22.326724 2016 |      2.673276
- 354 | Mon May 16 13:21:22.326724 2016 |   3602.673276
- 371 | Tue May 17 06:21:22.326724 2016 |  57597.326724
- 406 | Wed May 18 17:21:22.326724 2016 | 183597.326724
- 415 | Thu May 19 02:21:22.326724 2016 | 215997.326724
-(5 rows)
-```
-
-> **Warning:** Currently RUM has bogus behaviour when one creates an index using ordering over pass-by-reference additional information. This is due to the fact that posting trees have fixed length right bound and fixed length non-leaf posting items. It isn't allowed to create such indexes.
-
-### rum_tsvector_hash_addon_ops
-
-For type: `tsvector`
-
-This operator class stores a hash of `tsvector` lexemes with any supported by module
-field.
-
-It **doesn't** support prefix search.
-
-### rum_tsquery_ops
-
-For type: `tsquery`
-
-It stores branches of query tree in additional information. For example, we have the table:
-```sql
-CREATE TABLE query (q tsquery, tag text);
-
-INSERT INTO query VALUES ('supernova & star', 'sn'),
-    ('black', 'color'),
-    ('big & bang & black & hole', 'bang'),
-    ('spiral & galaxy', 'shape'),
-    ('black & hole', 'color');
-
-CREATE INDEX query_idx ON query USING rum(q);
-```
-
-Now we can execute the following fast query:
-```sql
-SELECT * FROM query
-    WHERE to_tsvector('black holes never exists before we think about them') @@ q;
-        q         |  tag
-------------------+-------
- 'black'          | color
- 'black' & 'hole' | color
-(2 rows)
-```
-
-### rum_anyarray_ops
-
-For type: `anyarray`
-
-This operator class stores `anyarray` elements with length of the array.
-It supports operators `&&`, `@>`, `<@`, `=`, `%` operators. It also supports ordering by `<=>` operator.
-For example, we have the table:
-
-```sql
-CREATE TABLE test_array (i int2[]);
-
-INSERT INTO test_array VALUES ('{}'), ('{0}'), ('{1,2,3,4}'), ('{1,2,3}'), ('{1,2}'), ('{1}');
-
-CREATE INDEX idx_array ON test_array USING rum (i rum_anyarray_ops);
-```
-
-Now we can execute the query using index scan:
-
-```sql
-SET enable_seqscan TO off;
-
-EXPLAIN (COSTS OFF) SELECT * FROM test_array WHERE i && '{1}' ORDER BY i <=> '{1}' ASC;
-                QUERY PLAN
-------------------------------------------
- Index Scan using idx_array on test_array
-   Index Cond: (i && '{1}'::smallint[])
-   Order By: (i <=> '{1}'::smallint[])
-(3 rows
-
-SELECT * FROM test_array WHERE i && '{1}' ORDER BY i <=> '{1}' ASC;
-     i
------------
- {1}
- {1,2}
- {1,2,3}
- {1,2,3,4}
-(4 rows)
-```
-
-### rum_anyarray_addon_ops
-
-For type: `anyarray`
-
-This operator class stores `anyarray` elements with any supported by module
-field.
-
-## Functions for low-level inspect of the RUM index pages
-
-The RUM index provides several functions for low-level inspect of all types of its pages:
-
-### `rum_metapage_info(rel_name text, blk_num int4) returns record`
-
-`rum_metapage_info` returns information about a RUM index metapage. For example:
-
-```SQL
-SELECT * FROM rum_metapage_info('rum_index', 0);
--[ RECORD 1 ]----+-----------
-pending_head     | 4294967295
-pending_tail     | 4294967295
-tail_free_size   | 0
-n_pending_pages  | 0
-n_pending_tuples | 0
-n_total_pages    | 87
-n_entry_pages    | 80
-n_data_pages     | 6
-n_entries        | 1650
-version          | 0xC0DE0002
-```
-
-### `rum_page_opaque_info(rel_name text, blk_num int4) returns record`
-
-`rum_page_opaque_info` returns information about a RUM index opaque area: `left` and `right` links, `maxoff` -- the number of elements that are stored on the page (this parameter is used differently for different types of pages), `freespace` -- free space on the page.
-
-For example:
-
-```SQL
-SELECT * FROM rum_page_opaque_info('rum_index', 10);
- leftlink | rightlink | maxoff | freespace | flags
-----------+-----------+--------+-----------+--------
-        6 |        11 |      0 |         0 | {leaf}
-```
-
-### `rum_internal_entry_page_items(rel_name text, blk_num int4) returns set of record`
-
-`rum_internal_entry_page_items` returns information that is stored on the internal pages of the entry tree (it is extracted from `IndexTuples`). For example:
-
-```SQL
-SELECT * FROM rum_internal_entry_page_items('rum_index', 1);
-               key               | attrnum |     category     | down_link
----------------------------------+---------+------------------+-----------
- 3d                              |       1 | RUM_CAT_NORM_KEY |         3
- 6k                              |       1 | RUM_CAT_NORM_KEY |         2
- a8                              |       1 | RUM_CAT_NORM_KEY |         4
-...
- Tue May 10 21:21:22.326724 2016 |       2 | RUM_CAT_NORM_KEY |        83
- Sat May 14 19:21:22.326724 2016 |       2 | RUM_CAT_NORM_KEY |        84
- Wed May 18 17:21:22.326724 2016 |       2 | RUM_CAT_NORM_KEY |        85
- +inf                            |         |                  |        86
-(79 rows)
-```
-
-RUM (like GIN) on the internal pages of the entry tree packs the downward link and the key in pairs of the following type: `(P_n, K_{n+1})`. It turns out that there is no key for `P_0` (it is assumed to be equal to `-inf`), and for the last key `K_{n+1}` there is no downward link (it is assumed that it is the largest key (or high key) in the subtree to which the `P_n` link leads). For this reason (the key is `+inf` because it is the rightmost page at the current level of the tree), in the example above, the last line contains the key `+inf` (this key does not have a downward link).
-
-### `rum_leaf_entry_page_items(rel_name text, blk_num int4) returns set of record`
-
-`rum_leaf_entry_page_items` returns information that is stored on the entry tree leaf pages (it is extracted from compressed posting lists). For example:
-
-```SQL
-SELECT * FROM rum_leaf_entry_page_items('rum_index', 10);
- key | attrnum |     category     | tuple_id | add_info_is_null | add_info | is_posting_tree | posting_tree_root
------+---------+------------------+----------+------------------+----------+------------------+--------------------
- ay  |       1 | RUM_CAT_NORM_KEY | (0,16)   | t                |          | f                |
- ay  |       1 | RUM_CAT_NORM_KEY | (0,23)   | t                |          | f                |
- ay  |       1 | RUM_CAT_NORM_KEY | (2,1)    | t                |          | f                |
-...
- az  |       1 | RUM_CAT_NORM_KEY | (0,15)   | t                |          | f                |
- az  |       1 | RUM_CAT_NORM_KEY | (0,22)   | t                |          | f                |
- az  |       1 | RUM_CAT_NORM_KEY | (1,4)    | t                |          | f                |
-...
- b9  |       1 | RUM_CAT_NORM_KEY |          |                  |          | t                |                  7
-...
-(1602 rows)
-```
-
-Each posting list is an `IndexTuple` that stores the key value and a compressed list of `tids`. In the function `rum_leaf_entry_page_items()`, the key value is attached to each `tid` for convenience, but on the page it is stored in a single instance.
-
-If the number of `tids` is too large, then instead of a posting list, a posting tree will be used for storage. In the example above, a posting tree was created (the key in the posting tree is the `tid`) for the key with the value `b9`. In this case, instead of the posting list, the magic number and the page number, which is the root of the posting tree, are stored inside the `IndexTuple`.
-
-### `rum_internal_data_page_items(rel_name text, blk_num int4) returns set of record`
-
-`rum_internal_data_page_items` returns information that is stored on the internal pages of the posting tree (it is extracted from arrays of `RumPostingItem` structures). For example:
-
-```SQL
-SELECT * FROM rum_internal_data_page_items('rum_index', 7);
- is_high_key | block_number | tuple_id | add_info_is_null | add_info
--------------+--------------+----------+------------------+----------
- t           |              | (0,0)    | t                |
- f           |            9 | (138,79) | t                |
- f           |            8 | (0,0)    | t                |
-(3 rows)
-```
-
-Each element on the internal pages of the posting tree contains the high key (`tid`) value for the child page and a link to this child page (as well as additional information if it was added when creating the index).
-
-At the beginning of the internal pages of the posting tree, the high key of this page is always stored (if it has the value `(0,0)`, this is equivalent to `+inf`; this is always performed if the page is the rightmost).
-
-At the moment, RUM does not support storing (as additional information) the data type that is pass by reference on the internal pages of the posting tree. Therefore, this output is possible:
-
-```SQL
- is_high_key | block_number | tuple_id | add_info_is_null |                    add_info
--------------+--------------+----------+------------------+------------------------------------------------
-...
- f           |           23 | (39,43)  | f                | varlena types in posting tree is not supported
- f           |           22 | (74,9)   | f                | varlena types in posting tree is not supported
-...
-```
-
-### `rum_leaf_data_page_items(rel_name text, blk_num int4) returns set of record`
-
-`rum_leaf_data_page_items` the function returns information that is stored on the leaf pages of the postnig tree (it is extracted from compressed posting lists). For example:
-
-```SQL
-SELECT * FROM rum_leaf_data_page_items('rum_idx', 9);
- is_high_key | tuple_id  | add_info_is_null | add_info
--------------+-----------+------------------+----------
- t           | (138,79)  | t                |
- f           | (0,9)     | t                |
- f           | (1,23)    | t                |
- f           | (3,5)     | t                |
- f           | (3,22)    | t                |
-```
-
-Unlike entry tree leaf pages, on posting tree leaf pages, compressed posting lists are not stored in an `IndexTuple`. The high key is the largest key on the page.
-
-## Todo
-
-- Allow multiple additional information (lexemes positions + timestamp).
-- Improve ranking function to support TF/IDF.
-- Improve insert time.
-- Improve GENERIC WAL to support shift (PostgreSQL core changes).
-
-## Authors
-
-Alexander Korotkov <a.korotkov@postgrespro.ru> Postgres Professional Ltd., Russia
-
-Oleg Bartunov <o.bartunov@postgrespro.ru> Postgres Professional Ltd., Russia
-
-Teodor Sigaev <teodor@postgrespro.ru> Postgres Professional Ltd., Russia
-
-Arthur Zakirov <a.zakirov@postgrespro.ru> Postgres Professional Ltd., Russia
-
-Pavel Borisov <p.borisov@postgrespro.com> Postgres Professional Ltd., Russia
-
-Maxim Orlov <m.orlov@postgrespro.ru> Postgres Professional Ltd., Russia
+# Experimental RUM ranked-search branch
+
+This branch explores improvements to ranked search in RUM while
+preserving the existing index format and write path. It lets compatible
+ordered scans derive a safe candidate-generation cover from opclass
+semantics, retain candidate-specific pruning where available, and reuse
+index evidence for ranking when the search and ordering expressions are
+proven equivalent.
+
+It also fixes a correctness bug in multicolumn scans that is independent
+of the rest of the branch.
+
+Base: `postgrespro/rum` at `d81c73f`. Developed and tested against
+PostgreSQL 20devel built with `--enable-cassert`. The upstream README is
+kept as `README.rum.md`.
+
+## What this branch changes
+
+**A multicolumn correctness fix.** A query whose scan touches two
+attributes of one RUM index could spin in `scanGetItemFast` until the OOM
+killer stopped the backend, or, depending on the data, return no rows.
+The fast scan keeps every entry in one array ordered by `cmpEntries()`
+and looks for the border at which `preConsistent()` turns false, treating
+the array as a single stream of positions. That ordering is positional
+only within one attribute: `cmpEntries()` compares `attnumOrig` first and
+never reaches the item pointers when the attributes differ. The branch
+uses the regular scan when the entries span several attributes.
+
+**Three separate mechanisms for ranked search**, worth naming apart
+because they pay in different situations:
+
+- *candidate-generation cover* — the set of entries that every matching
+  row must intersect, so that merging only those still produces every
+  candidate. Previously computed arithmetically from an opclass query
+  minimum; now also derived from `preConsistent` for opclasses that
+  cannot state such a minimum, which is how `rum_tsvector_ops` reaches
+  this path at all.
+- *candidate-specific pruning* — rejecting a candidate from the
+  document's own payload before probing the remaining entries. Available
+  where the opclass provides a per-candidate bound, as `rum_trgm` does.
+- *evidence reuse* — when the order-by key asks the same question of the
+  same attribute as the search key, ranking takes the evidence the
+  matching side already gathered instead of reading the same postings
+  again.
+
+## Why
+
+An ordered query lost the candidate-aware machinery entirely: one
+order-by key dropped the whole scan onto a different path. Matching
+evidence and ordering evidence were treated as belonging to separate
+scans even when they were the same evidence. And the arithmetic form of
+the cover excluded full-text search by construction.
+
+## Results
+
+Ranked trigram similarity, `WHERE body % q ORDER BY body <-> q LIMIT n`,
+200 000 documents, warm median of five runs, one binary:
+
+| threshold | baseline | + candidate-aware ordered | + evidence reuse |
+|---|---|---|---|
+| 0.05, LIMIT 10 | 867 ms | 667 ms | 433 ms |
+| 0.10, LIMIT 10 | 722 ms | 367 ms | 279 ms |
+| 0.15, LIMIT 10 | 715 ms | 221 ms | 218 ms |
+
+**1.6x–3.5x on the tested ranked trigram similarity workload.** The same
+shape appears on a 10 000-document corpus, so the effect is not an
+artifact of the duplication used to build the larger one.
+
+The two mechanisms pay in opposite regimes, which the counters show:
+
+- **strong rejection favours the cover and pruning.** At threshold 0.15,
+  99% of candidates are rejected before any probe, and that is where the
+  ordered scan gets its 3.2x.
+- **many ranking survivors favour evidence reuse.** At threshold 0.05,
+  111 040 candidates reach ranking and 3.66M redundant seeks disappear;
+  at 0.15 only 900 do, and reuse is within noise.
+
+Ranked full-text search, `WHERE tsv @@ q ORDER BY tsv <=> q`, 20 000
+documents:
+
+| query | change |
+|---|---|
+| `foo & bar & alpha` | −22% |
+| `phraseto_tsquery('foo qux bar')` | −15% |
+| `(foo & bar) \| (epsilon & alpha)` | −25% |
+
+These milliseconds are not comparable with the trigram table above:
+different corpus, different opclass.
+
+## Correctness checks
+
+- `make installcheck` — 38 regression tests, including a `multicol` test
+  that does not terminate without the fix, and a `rum_trgm` test checking
+  trigram extraction against `pg_trgm` and index results against
+  sequential scans at four thresholds.
+- Cover safety, `bench/cover_property_test.sql`: 300 generated boolean
+  queries over ten shapes, 435 331 matched rows, nothing lost or
+  invented; the candidate-aware path engages for every eligible
+  multi-entry query.
+- Positional safety, `bench/phrase_cover_property.sql`: eighteen phrase
+  queries on a corpus built for adjacency, seventeen non-empty, nothing
+  lost.
+- Multicolumn corner, `bench/multicolumn_corner.sql`: single-key
+  predicates on a two-column index agree with sequential scans, and a
+  word present only in the other column returns nothing.
+- Evidence-reuse controls, `bench/fts_regression.sql`: `q1 <> q2`,
+  ordering on a different column, `rum_tsvector_ops` and
+  `rum_tsvector_addon_ops` ordering all keep the previous path and
+  byte-identical results. Reuse activates only when the access method has
+  proven the two keys equivalent, entry by entry.
+
+## Write-path impact
+
+**The patches do not change the index format, insertion, vacuum or WAL
+paths.** Measured control, baseline against this branch:
+
+- `INSERT`, `UPDATE` and `DELETE` produce **byte-identical WAL volume**.
+- `CREATE INDEX`, `CREATE INDEX CONCURRENTLY` and `VACUUM` leave a
+  **byte-identical index size**.
+- No repeatable write-side latency difference. The small differences seen
+  are in the direction and magnitude that cache warming explains, and a
+  scan-only change cannot speed up an insert.
+
+Unrelated to this branch but worth knowing before benchmarking: baseline
+RUM's insert path is expensive without a pending list — inserting 10 000
+rows into a `rum_trgm_ops` index took about 95 seconds and wrote about
+5.98 GB of WAL on the test machine. Existing behaviour, and a subject for
+future architectural work.
+
+## Reproduce
+
+    git clone https://github.com/postgrespro/rum.git
+    cd rum
+    git checkout d81c73f
+    git fetch /path/to/rum-ranked-search.bundle 'refs/heads/*:refs/remotes/bundle/*'
+    git checkout -b ranked bundle/oleg/rum-ranked-search
+
+    make USE_PGXS=1
+    pg_ctl -D $PGDATA stop            # install with the server stopped
+    make USE_PGXS=1 install
+    pg_ctl -D $PGDATA start
+    make USE_PGXS=1 installcheck
+
+Benchmarks and property tests need a corpus and a running server:
+
+    python3 bench/generate_natural_corpus.py \
+        --mbox pgsql-hackers.202203.mbox --out corpus_c10k --stratified 10000
+
+    createdb bench
+    psql -d bench -c "CREATE EXTENSION rum; CREATE EXTENSION pg_trgm; CREATE EXTENSION rum_trgm;"
+    psql -d bench -c "CREATE TABLE msgs (msg_no int, chunk_no int, subject text, body text, id int)"
+    psql -d bench -c "\copy msgs FROM 'corpus_c10k.csv' CSV"
+    psql -d bench -c "CREATE TABLE big_c AS SELECT (m.id + 10000*k) id, m.body FROM msgs m, generate_series(0,19) k"
+    psql -d bench -c "CREATE INDEX big_rum ON big_c USING rum (body rum_trgm_ops)"
+
+    bash bench/bench_ordered.sh timings      # the table above
+    bash bench/bench_ordered.sh controls     # negative controls
+    bash bench/bench_writes.sh               # write-path control
+
+    psql -d bench -f bench/cover_property_test.sql
+    psql -d bench -f bench/phrase_cover_property.sql
+    psql -d bench -f bench/multicolumn_corner.sql
+
+The corpus generator is a pure function of the input bytes — no sampling,
+no seed — and writes a manifest with checksums, message coverage and the
+chunk-length distribution beside the corpus.
+
+## Scope / known limitations
+
+- Partial-match entries are outside this work. One query entry expanding
+  into many index keys is a different model and the cover argument does
+  not carry over; such scans keep their existing path.
+- A query with search keys on more than one attribute does not use the
+  candidate-aware path.
+- Evidence reuse requires the order-by key to be an ordinary entry-based
+  key on the same attribute with the same entries. Alternative-order
+  addon scans are excluded explicitly: routing them elsewhere returns no
+  rows, which is how that exclusion was found.
+- The trigram results come from one corpus family and one machine. The
+  ratios are the claim; the absolute milliseconds are not portable.
+- The multicolumn fix is a restriction rather than a repair: it makes the
+  entry condition match the fast scan's actual precondition. Making the
+  border search attribute-aware would be a redesign, needing a positional
+  comparator across attributes that `cmpEntries()` does not provide.
+
+## Commit structure
+
+     1  Do not use the fast scan when its entries span several attributes
+     2  Defer first-page decode of posting-tree scan entries
+     3  Add opclass query-minimum-match support
+     4  Generate scan candidates from a sufficient subset of entries
+     5  Refine the match bound per candidate from document-level addInfo
+     6  Add rum_trgm: trigram similarity opclass for RUM
+     7  Cache candidate bounds in a direct-mapped table
+     8  Run the rum_trgm exactness test as part of installcheck
+     9  Derive the candidate-generation cover from preConsistent
+    10  Let compatible ordered scans use the candidate-aware path
+    11  Reuse matching evidence for equivalent ordering keys
+    12  Add reproducible benchmarks, property tests and this README
+
+Commits 2–8 are the prerequisite machinery — what makes a
+candidate-generating scan exist at all — and 9–11 are the ranked-search
+work proper. Commit 1 is independent of everything after it and can be
+taken on its own.
