@@ -39,13 +39,6 @@ PG_FUNCTION_INFO_V1(rumhandler);
 /* Kind of relation optioms for rum index */
 static relopt_kind rum_relopt_kind;
 
-bool		RumCandidateTriConsistent = false;
-bool		RumOrderedCandidatePruning = true;
-bool		RumTrgmRankFromMatch = true;
-#ifdef RUM_SCAN_INSTRUMENT
-uint64		RumMatchPosDecodes = 0;
-uint64		RumRankPosDecodes = 0;
-#endif
 
 static const struct config_enum_entry rum_array_similarity_function_opts[] =
 {
@@ -62,34 +55,6 @@ void
 _PG_init(void)
 {
 	/* Define custom GUC variables. */
-	DefineCustomBoolVariable("rum.candidate_triconsistent",
-							 "Research probe: decide candidates with a "
-							 "payload-aware tri-state instead of an integer bound.",
-							 NULL,
-							 &RumCandidateTriConsistent,
-							 false,
-							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("rum.ordered_candidate_pruning",
-							 "Let an ordered scan use candidate pruning for "
-							 "its search key (experimental).",
-							 NULL,
-							 &RumOrderedCandidatePruning,
-							 true,
-							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("rum.trgm_rank_from_match",
-							 "Compute an order-by key's value from the match "
-							 "evidence when it duplicates the search key "
-							 "(experimental).",
-							 NULL,
-							 &RumTrgmRankFromMatch,
-							 true,
-							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-
 	DefineCustomIntVariable("rum_fuzzy_search_limit",
 				  "Sets the maximum allowed result for exact search by RUM.",
 							NULL,

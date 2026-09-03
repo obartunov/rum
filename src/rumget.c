@@ -827,6 +827,7 @@ startScan(IndexScanDesc scan)
 	RumState   *rumstate = &so->rumstate;
 	uint32		i;
 	RumScanType	scanType = RumFastScan;
+	bool		orderByKeySkipped;
 
 	MemoryContextSwitchTo(so->keyCtx);
 	for (i = 0; i < so->totalentries; i++)
@@ -883,6 +884,7 @@ startScan(IndexScanDesc scan)
 	 * checking if at least one key have not preConsistent method and use
 	 * regular scan.
 	 */
+	orderByKeySkipped = false;
 	for (i = 0; i < so->nkeys; i++)
 	{
 		RumScanKey	key = so->keys[i];
@@ -892,6 +894,30 @@ startScan(IndexScanDesc scan)
 		{
 			scanType = RumFullScan;
 			break;
+		}
+		/*
+		 * An order-by key carries neither preConsistent nor minMatches; it
+		 * contributes ordering, not a matching precondition, and the
+		 * counting path below already excludes it from the search-key count
+		 * and synchronizes its entries at emission.  Letting it fall into
+		 * the clause below drops the whole scan to RumRegularScan and
+		 * forfeits candidate pruning, so skip it here -- but remember that
+		 * we did, because only the counting path is prepared for it.
+		 */
+		else if (key->orderBy &&
+				 !rumstate->useAlternativeOrder &&
+				 !so->scanWithAltOrderKeys &&
+				 !key->useAddToColumn && !key->useCurKey)
+		{
+			/*
+			 * Only an ordinary entry-based order-by key may be skipped.  A
+			 * key of the alternative-order machinery -- an attached column
+			 * with order_by_attach, or any scan where useAlternativeOrder is
+			 * set -- is served by a scan path that RumRegularScan cannot
+			 * replace: routing such a scan there returns no rows at all.
+			 */
+			orderByKeySkipped = true;
+			continue;
 		}
 		/* Else check keys for preConsistent or counting method */
 		else if (!so->rumstate.canPreConsistent[key->attnum - 1] &&
@@ -1016,6 +1042,14 @@ startScan(IndexScanDesc scan)
 			}
 		}
 	}
+
+	/*
+	 * An order-by key was skipped above only on the expectation that the
+	 * counting path would take the scan.  If it did not, the plain fast
+	 * scan has no provision for ordering entries, so fall back.
+	 */
+	if (scanType == RumFastScan && orderByKeySkipped)
+		scanType = RumRegularScan;
 
 	if (scanType == RumFastScan)
 	{
