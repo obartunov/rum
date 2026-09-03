@@ -1175,6 +1175,78 @@ startScan(IndexScanDesc scan)
 			cs->pendingValid = false;
 
 			/*
+			 * Research probe: can the order-by key's value be computed from
+			 * the match evidence?  Only when it is a duplicate of the search
+			 * key -- same attribute, same number of entries, and every entry
+			 * equal to a search-key entry under the opclass compare.  Early
+			 * TRUE from the candidate tri-consistent leaves the match
+			 * evidence complete, which the reuse below depends on.
+			 */
+			cs->rankKey = NULL;
+			cs->rankMap = NULL;
+			{
+				RumScanKey	obKey = NULL;
+				int			nOrderBy = 0;
+
+				for (i = 0; i < so->nkeys; i++)
+					if (so->keys[i]->orderBy)
+					{
+						obKey = so->keys[i];
+						nOrderBy++;
+					}
+
+				if (nOrderBy == 1 && obKey != NULL &&
+					!obKey->useAddToColumn && !obKey->useCurKey &&
+					obKey->attnum == ckey->attnum &&
+					obKey->nentries == ckey->nentries &&
+					obKey->nentries > 0)
+				{
+					int		   *map = (int *) palloc(sizeof(int) * obKey->nentries);
+					bool		ok = true;
+					uint32		a,
+								b;
+
+					for (a = 0; a < obKey->nentries && ok; a++)
+					{
+						map[a] = -1;
+						for (b = 0; b < ckey->nentries; b++)
+						{
+							RumScanEntry oe = obKey->scanEntry[a];
+							RumScanEntry se = ckey->scanEntry[b];
+
+							if (oe->queryCategory != se->queryCategory)
+								continue;
+							if (oe->queryCategory == RUM_CAT_NORM_KEY &&
+								DatumGetInt32(FunctionCall2Coll(
+									&rumstate->compareFn[ckey->attnum - 1],
+									rumstate->supportCollation[ckey->attnum - 1],
+									oe->queryKey, se->queryKey)) != 0)
+								continue;
+							map[a] = (int) b;
+							break;
+						}
+						if (map[a] < 0)
+							ok = false;
+					}
+
+					if (ok)
+					{
+						cs->rankKey = obKey;
+						cs->rankMap = map;
+						obKey->rankFromMatch = true;
+					}
+					else
+						pfree(map);
+				}
+			}
+
+#ifdef RUM_SCAN_INSTRUMENT
+			so->instr.queryEntries = ckey->nentries;
+			so->instr.generatorEntries = cs->nRare;
+			so->instr.probeEntries = ckey->nentries - cs->nRare;
+#endif
+
+			/*
 			 * Prime only the generator entries: probe and sync entries are
 			 * read lazily on first seek, so their deferred first pages are
 			 * never decoded unless a candidate actually needs them.
@@ -2827,15 +2899,40 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 			 * to the candidate so keyGetOrdering computes the distance
 			 * from correct positions.
 			 */
-			for (s = 0; s < cs->nSync; s++)
+			if (cs->rankKey != NULL)
 			{
-				RumScanEntry entry = cs->sync[s];
+				/*
+				 * The order-by key duplicates the search key, so the
+				 * evidence just gathered for matching is exactly what its
+				 * ordering function needs.  Copy it across instead of
+				 * seeking its entries to this candidate.
+				 */
+				RumScanKey	rk = cs->rankKey;
+				uint32		r;
 
-				if (!entry->isFinished &&
-					rumCompareItemPointers(&entry->curItem.iptr,
-										   &candidate.iptr) < 0)
-					entryFindItem(rumstate, entry, &candidate,
-								  scan->xs_snapshot);
+				for (r = 0; r < rk->nentries; r++)
+				{
+					int			m = cs->rankMap[r];
+
+					rk->entryRes[r] = key->entryRes[m];
+					rk->addInfo[r] = key->addInfo[m];
+					rk->addInfoIsNull[r] = key->addInfoIsNull[m];
+				}
+			}
+			else
+			{
+				for (s = 0; s < cs->nSync; s++)
+				{
+					RumScanEntry entry = cs->sync[s];
+
+					if (!entry->isFinished &&
+						rumCompareItemPointers(&entry->curItem.iptr,
+											   &candidate.iptr) < 0)
+					{
+						entryFindItem(rumstate, entry, &candidate,
+									  scan->xs_snapshot);
+					}
+				}
 			}
 
 			cs->pending = candidate;
@@ -3152,21 +3249,24 @@ keyGetOrdering(RumState * rumstate, MemoryContext tempCtx, RumScanKey key,
 											));
 	}
 
-	for (i = 0; i < key->nentries; i++)
+	if (!key->rankFromMatch)
 	{
-		entry = key->scanEntry[i];
-		if (entry->isFinished == false &&
-			rumCompareItemPointers(&entry->curItem.iptr, iptr) == 0)
+		for (i = 0; i < key->nentries; i++)
 		{
-			key->addInfo[i] = entry->curItem.addInfo;
-			key->addInfoIsNull[i] = entry->curItem.addInfoIsNull;
-			key->entryRes[i] = true;
-		}
-		else
-		{
-			key->addInfo[i] = (Datum) 0;
-			key->addInfoIsNull[i] = true;
-			key->entryRes[i] = false;
+			entry = key->scanEntry[i];
+			if (entry->isFinished == false &&
+				rumCompareItemPointers(&entry->curItem.iptr, iptr) == 0)
+			{
+				key->addInfo[i] = entry->curItem.addInfo;
+				key->addInfoIsNull[i] = entry->curItem.addInfoIsNull;
+				key->entryRes[i] = true;
+			}
+			else
+			{
+				key->addInfo[i] = (Datum) 0;
+				key->addInfoIsNull[i] = true;
+				key->entryRes[i] = false;
+			}
 		}
 	}
 

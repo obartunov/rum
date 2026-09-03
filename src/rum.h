@@ -636,6 +636,8 @@ typedef struct RumScanKeyData
 	Datum		curKey;
 	RumNullCategory curKeyCategory;
 	bool		useCurKey;
+	bool		rankFromMatch;	/* entryRes/addInfo already supplied by the
+								 * match side; do not re-read positions */
 
 	/* other data needed for calling consistentFn */
 	Datum		query;
@@ -780,6 +782,16 @@ typedef struct RumCountingScanState
 								 * the frequency-sorted prefix */
 	RumScanEntry *sync;			/* sync entries and their count */
 	uint32		nSync;
+
+	/*
+	 * Research probe (rum.trgm_rank_from_match): when the order-by key is a
+	 * duplicate of the search key -- same attribute, same entries -- its
+	 * ordering can be computed from the evidence the match side already
+	 * gathered, instead of positioning its own entries again.  rankKey is
+	 * that key and rankMap[j] is the search-key entry equal to its entry j.
+	 */
+	RumScanKey	rankKey;
+	int		   *rankMap;
 	bool		pendingValid;	/* generators standing at pending must be
 								 * advanced before producing the next
 								 * candidate; deferred so keyGetOrdering
@@ -991,6 +1003,7 @@ extern PGDLLEXPORT Datum rum_anyarray_distance(PG_FUNCTION_ARGS);
 
 /* GUC parameters */
 extern int		RumFuzzySearchLimit;
+extern bool		RumOrderedCandidatePruning;
 extern float8	RumArraySimilarityThreshold;
 extern int		RumArraySimilarityFunction;
 
