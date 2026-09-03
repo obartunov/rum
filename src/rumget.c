@@ -977,10 +977,19 @@ startScan(IndexScanDesc scan)
 		}
 
 		if (nSearchKeys == 1 &&
-			searchKey->minMatches >= 2 &&
+			(( searchKey->minMatches >= 2 &&
+			   searchKey->nentries >= searchKey->minMatches) ||
+			 /*
+			  * An opclass that cannot state a query minimum can still tell
+			  * us whether a match remains possible for a given pattern of
+			  * present entries.  That is enough to derive a sufficient
+			  * cover, so admit it too.
+			  */
+			 (searchKey->minMatches < 0 &&
+			  so->rumstate.canPreConsistent[searchKey->attnum - 1] &&
+			  searchKey->nentries > 1)) &&
 			searchKey->searchMode == GIN_SEARCH_MODE_DEFAULT &&
 			searchKey->nentries == searchKey->nuserentries &&
-			searchKey->nentries >= searchKey->minMatches &&
 			ScanDirectionIsForward(searchKey->scanDirection))
 		{
 			bool		entriesOk = true;
@@ -1049,7 +1058,61 @@ startScan(IndexScanDesc scan)
 				   sizeof(RumScanEntry) * ckey->nentries);
 			qsort_arg(so->sortedEntries, ckey->nentries, sizeof(RumScanEntry),
 					  counting_entry_freq_cmp, rumstate);
-			cs->nRare = ckey->nentries - ckey->minMatches + 1;
+			if (ckey->minMatches >= 2)
+				cs->nRare = ckey->nentries - ckey->minMatches + 1;
+			else
+			{
+				/*
+				 * Derive the cover the way modern GIN does, by asking the
+				 * opclass rather than by arithmetic: entries are already
+				 * ordered least frequent first, so take the smallest prefix
+				 * whose complete absence makes a match impossible.  A row
+				 * missing all of them cannot match, so merging just those
+				 * produces every candidate.
+				 *
+				 * The loop always terminates: with the whole entry set
+				 * absent, preConsistent must report no match.
+				 */
+				bool		recheck = false;
+				uint32		c;
+
+				cs->nRare = ckey->nentries;
+				for (c = 1; c <= (uint32) ckey->nentries; c++)
+				{
+					uint32		e;
+
+					for (e = 0; e < (uint32) ckey->nentries; e++)
+						ckey->entryRes[e] = true;
+					for (e = 0; e < c; e++)
+					{
+						uint32		s;
+
+						/* map sorted position e back to the key's order */
+						for (s = 0; s < (uint32) ckey->nentries; s++)
+							if (ckey->scanEntry[s] == so->sortedEntries[e])
+							{
+								ckey->entryRes[s] = false;
+								break;
+							}
+					}
+
+					if (!DatumGetBool(FunctionCall8Coll(
+							&rumstate->preConsistentFn[ckey->attnum - 1],
+							rumstate->supportCollation[ckey->attnum - 1],
+							PointerGetDatum(ckey->entryRes),
+							UInt16GetDatum(ckey->strategy),
+							ckey->query,
+							UInt32GetDatum(ckey->nuserentries),
+							PointerGetDatum(ckey->extra_data),
+							PointerGetDatum(&recheck),
+							PointerGetDatum(ckey->queryValues),
+							PointerGetDatum(ckey->queryCategories))))
+					{
+						cs->nRare = c;
+						break;
+					}
+				}
+			}
 
 			cs->roles = (RumEntryScanRole *)
 				palloc(sizeof(RumEntryScanRole) * ckey->nentries);
@@ -2515,7 +2578,7 @@ scanGetItemCounting(IndexScanDesc scan, RumItem *advancePast,
 	RumCountingScanState *cs = so->countingState;
 	RumScanKey	key = cs->key;
 	uint32		nRare = cs->nRare;
-	uint32		needed = (uint32) key->minMatches;
+	uint32		needed = key->minMatches >= 2 ? (uint32) key->minMatches : 1;
 	uint32		required;
 	Datum		docAddInfo;
 	bool		docAddInfoValid;
