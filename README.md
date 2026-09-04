@@ -141,15 +141,28 @@ future architectural work.
     pg_ctl -D $PGDATA start
     make USE_PGXS=1 installcheck
 
-Benchmarks and property tests need a corpus and a running server:
+### Benchmarks
 
-    python3 bench/generate_natural_corpus.py \
-        --mbox pgsql-hackers.202203.mbox --out corpus_c10k --stratified 10000
+The benchmark input is fixed and shipped with the branch, so reproducing
+the numbers does not involve reproducing the corpus:
+
+    bench/data/corpus_c10k.csv.gz        10 000 documents, 3.7 MB packed
+    bench/data/corpus_c10k.sha256        checksums for packed and unpacked
+    bench/data/corpus_c10k.manifest.json how it was derived
+
+Two people running this benchmark are then comparing milliseconds on the
+same bytes, which is the point.
+
+    cd bench/data
+    shasum -a 256 -c corpus_c10k.sha256   # checks the .gz
+    gunzip -k corpus_c10k.csv.gz
+    shasum -a 256 -c corpus_c10k.sha256   # now checks both
+    cd ../..
 
     createdb bench
     psql -d bench -c "CREATE EXTENSION rum; CREATE EXTENSION pg_trgm; CREATE EXTENSION rum_trgm;"
     psql -d bench -c "CREATE TABLE msgs (msg_no int, chunk_no int, subject text, body text, id int)"
-    psql -d bench -c "\copy msgs FROM 'corpus_c10k.csv' CSV"
+    psql -d bench -c "\copy msgs FROM 'bench/data/corpus_c10k.csv' CSV"
     psql -d bench -c "CREATE TABLE big_c AS SELECT (m.id + 10000*k) id, m.body FROM msgs m, generate_series(0,19) k"
     psql -d bench -c "CREATE INDEX big_rum ON big_c USING rum (body rum_trgm_ops)"
 
@@ -157,13 +170,29 @@ Benchmarks and property tests need a corpus and a running server:
     bash bench/bench_ordered.sh controls     # negative controls
     bash bench/bench_writes.sh               # write-path control
 
-    psql -d bench -f bench/cover_property_test.sql
-    psql -d bench -f bench/phrase_cover_property.sql
-    psql -d bench -f bench/multicolumn_corner.sql
+### Correctness tests need no corpus at all
 
-The corpus generator is a pure function of the input bytes — no sampling,
-no seed — and writes a manifest with checksums, message coverage and the
-chunk-length distribution beside the corpus.
+They build their own tables and run against an empty database:
+
+    createdb fresh
+    psql -d fresh -c "CREATE EXTENSION rum"
+    psql -d fresh -f bench/cover_property_test.sql
+    psql -d fresh -f bench/phrase_cover_property.sql
+    psql -d fresh -f bench/multicolumn_corner.sql
+
+`make installcheck` likewise needs nothing beyond a running server.
+
+### Where the corpus came from
+
+`tools/generate_natural_corpus.py` is kept as provenance, not as a step
+in reproducing anything.  It turned one month of the pgsql-hackers
+archive — `pgsql-hackers.202203.mbox`, 80 639 431 bytes, sha256
+`1a25dd24...80ccf2` — into the shipped CSV, deterministically: a pure
+function of the input bytes, no sampling and no seed, with chunks taken
+round-robin across messages so that 10 000 documents still span 3 236 of
+the 3 594 messages.  Run it only if you want a different corpus; then the
+absolute milliseconds are yours, not comparable with the table above.
+
 
 ## Scope / known limitations
 
@@ -197,6 +226,7 @@ chunk-length distribution beside the corpus.
     10  Let compatible ordered scans use the candidate-aware path
     11  Reuse matching evidence for equivalent ordering keys
     12  Add reproducible benchmarks, property tests and this README
+    13  Ship the benchmark corpus instead of a recipe for building it
 
 Commits 2–8 are the prerequisite machinery — what makes a
 candidate-generating scan exist at all — and 9–11 are the ranked-search

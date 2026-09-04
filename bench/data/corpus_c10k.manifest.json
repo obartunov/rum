@@ -1,0 +1,47 @@
+{
+  "name": "corpus_c10k",
+  "purpose": "fixed benchmark input for the RUM ranked-search branch",
+  "source": {
+    "description": "one month of the pgsql-hackers mailing list archive",
+    "file": "pgsql-hackers.202203.mbox",
+    "bytes": 80639431,
+    "sha256": "1a25dd2410505cb43f07d013c2eead44d0e8687723b9c57d598df1824080ccf2"
+  },
+  "generator": {
+    "script": "tools/generate_natural_corpus.py",
+    "deterministic": true,
+    "sampling": "none",
+    "seed": null,
+    "selection": "round-robin across messages, limit 10000"
+  },
+  "output": {
+    "file": "corpus_c10k.csv",
+    "sha256": "923053452011e112f09565c72a6b2a73d775a8ebda35d94192809ec909b15678",
+    "documents": 10000,
+    "messages_represented": 3236,
+    "messages_in_source": 3594,
+    "columns": [
+      "msg_no",
+      "chunk_no",
+      "subject",
+      "body",
+      "id"
+    ]
+  },
+  "rules": {
+    "chunk_bytes": 1000,
+    "minimum_chunk_bytes": 200,
+    "dropped_line_prefixes": [
+      "+",
+      "-",
+      ">",
+      "diff ",
+      "index ",
+      "@@",
+      "--- ",
+      "+++ "
+    ],
+    "line_endings": "CRLF and CR normalised to LF",
+    "whitespace": "collapsed to single spaces"
+  }
+}
