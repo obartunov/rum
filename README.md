@@ -164,7 +164,17 @@ same bytes, which is the point.
     psql -d bench -c "CREATE TABLE msgs (msg_no int, chunk_no int, subject text, body text, id int)"
     psql -d bench -c "\copy msgs FROM 'bench/data/corpus_c10k.csv' CSV"
     psql -d bench -c "CREATE TABLE big_c AS SELECT (m.id + 10000*k) id, m.body FROM msgs m, generate_series(0,19) k"
+    psql -d bench -c "CREATE INDEX msgs_rum ON msgs USING rum (body rum_trgm_ops)"
     psql -d bench -c "CREATE INDEX big_rum ON big_c USING rum (body rum_trgm_ops)"
+
+The two indexes are the two corpus sizes the benchmark compares; `big_rum`
+is about 1 GB, so make sure the cluster has room for it.
+
+`bench_ordered.sh` refuses to run unless each table has its index, the
+plan really is an `Index Scan` using it, and the index and a sequential
+scan return the same number of rows.  `enable_seqscan = off` is only a
+planner penalty: without that check a missing index yields a sequential
+scan, correct answers and a meaningless timing.
 
     bash bench/bench_ordered.sh timings      # the table above
     bash bench/bench_ordered.sh controls     # negative controls
@@ -227,8 +237,11 @@ absolute milliseconds are yours, not comparable with the table above.
     11  Reuse matching evidence for equivalent ordering keys
     12  Add reproducible benchmarks, property tests and this README
     13  Ship the benchmark corpus instead of a recipe for building it
+    14  Fail benchmarks when the expected RUM index plan is not used
 
 Commits 2–8 are the prerequisite machinery — what makes a
 candidate-generating scan exist at all — and 9–11 are the ranked-search
-work proper. Commit 1 is independent of everything after it and can be
+work proper. Commits 12–14 are tests, benchmarks and their preconditions,
+and carry no access-method change. Commit 1 is independent of everything
+after it and can be
 taken on its own.

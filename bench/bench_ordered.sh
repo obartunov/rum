@@ -12,7 +12,7 @@
 #   bench_ordered.sh controls
 #   bench_ordered.sh writes     write-side control: expect no difference
 set -u
-PSQL="/home/claude/pg20/bin/psql -h /tmp/pgsock20 -p 5455 -X t20"
+PSQL="/home/claude/pg20/bin/psql -h /tmp/pgsock20 -p 5455 -X -qtA t20"
 RUNS=5
 Q="I am attaching the patch for the current master branch and the test results"
 
@@ -28,7 +28,98 @@ guc_for() {
 
 median() { sort -n | awk '{a[NR]=$1} END {print (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
 
+
+# Expected RUM index per benchmark table.  The benchmark must measure the
+# index it claims to measure: enable_seqscan=off is only a planner
+# penalty, so a missing index produces a sequential scan, correct answers
+# and a meaningless number.  One such run took 20.8 s instead of 214 ms
+# and looked like a result.
+idx_for() { case "$1" in msgs) echo msgs_rum ;; big_c) echo big_rum ;; esac; }
+
+preflight() {
+    local fail=0 tbl idx nidx nseq plan got
+
+    for tbl in msgs big_c; do
+        idx=$(idx_for "$tbl")
+
+        # 1. the index exists
+        if [ "$(su postgres -c "$PSQL" <<EOF
+SELECT to_regclass('$idx') IS NOT NULL;
+EOF
+)" != "t" ]; then
+            echo "ERROR: benchmark precondition failed:" >&2
+            echo "  index $idx on $tbl does not exist" >&2
+            echo "  create it with:" >&2
+            echo "    CREATE INDEX $idx ON $tbl USING rum (body rum_trgm_ops);" >&2
+            fail=1
+            continue
+        fi
+
+        # 2. the plan really uses that index
+        plan=$(su postgres -c "$PSQL" <<EOF
+SET enable_seqscan=off;
+SET pg_trgm.similarity_threshold=0.15;
+EXPLAIN (FORMAT JSON) SELECT body FROM $tbl WHERE body % '$Q' ORDER BY body <-> '$Q' LIMIT 10;
+EOF
+)
+        if ! printf '%s' "$plan" | python3 -c "
+import sys, json
+want = sys.argv[1]
+plan = json.load(sys.stdin)[0]['Plan']
+def walk(n):
+    if n.get('Index Name') == want and 'Index Scan' in n['Node Type']:
+        return True
+    return any(walk(c) for c in n.get('Plans', []))
+sys.exit(0 if walk(plan) else 1)
+" "$idx" 2>/dev/null; then
+            got=$(printf '%s' "$plan" | python3 -c "
+import sys, json
+plan = json.load(sys.stdin)[0]['Plan']
+def first(n):
+    if 'Scan' in n['Node Type']:
+        return n['Node Type'] + (' using ' + n['Index Name'] if 'Index Name' in n else '')
+    for c in n.get('Plans', []):
+        r = first(c)
+        if r:
+            return r
+    return None
+print(first(plan) or plan['Node Type'])" 2>/dev/null)
+            echo "ERROR: benchmark precondition failed:" >&2
+            echo "  expected Index Scan using $idx" >&2
+            echo "  got ${got:-unparseable plan}" >&2
+            fail=1
+            continue
+        fi
+
+        # 3. the index answers the same as a sequential scan
+        nidx=$(su postgres -c "$PSQL" <<EOF
+SET enable_seqscan=off;
+SET pg_trgm.similarity_threshold=0.15;
+SELECT count(*) FROM $tbl WHERE body % '$Q';
+EOF
+)
+        nseq=$(su postgres -c "$PSQL" <<EOF
+SET enable_indexscan=off;
+SET enable_bitmapscan=off;
+SET pg_trgm.similarity_threshold=0.15;
+SELECT count(*) FROM $tbl WHERE body % '$Q';
+EOF
+)
+        if [ "$nidx" != "$nseq" ]; then
+            echo "ERROR: benchmark precondition failed:" >&2
+            echo "  $tbl: index returned $nidx rows, sequential scan returned $nseq" >&2
+            fail=1
+            continue
+        fi
+
+        printf "preflight %-6s ok: Index Scan using %-8s rows=%s\n" "$tbl" "$idx" "$nidx"
+    done
+
+    [ "$fail" = 0 ] || exit 1
+}
+
 timings() {
+    preflight
     printf "%-8s %-6s %-6s %-6s %10s %10s\n" corpus t limit mode "median ms" "runs"
     for tbl in msgs big_c; do
         for t in 0.05 0.10 0.15; do
