@@ -135,6 +135,29 @@ future architectural work.
     git fetch /path/to/rum-ranked-search.bundle 'refs/heads/*:refs/remotes/bundle/*'
     git checkout -b ranked bundle/oleg/rum-ranked-search
 
+Fetching into `refs/remotes/` rather than straight into a branch is
+deliberate, and matters more for the update case below than here.
+`git fetch <bundle> ranked:ranked` fails with
+
+    fatal: refusing to fetch into branch 'refs/heads/ranked' checked out at ...
+
+whenever that branch is the one you are standing on, which is exactly the
+case when applying a later bundle to a branch you already have.  The form
+above always works, and it leaves `bundle/...` behind as a ref you can
+diff against.
+
+To move an existing branch forward onto a newer bundle:
+
+    git fetch /path/to/newer.bundle 'ranked:refs/remotes/bundle/ranked'
+    git log --oneline ranked..bundle/ranked      # what is coming
+    git diff --stat ranked bundle/ranked
+    git merge --ff-only bundle/ranked
+
+`--ff-only` is the point: if the histories have diverged it refuses
+rather than quietly building a merge commit.  The shorter
+`git pull --ff-only /path/to/newer.bundle ranked` does the same in one
+step.
+
     make USE_PGXS=1
     pg_ctl -D $PGDATA stop            # install with the server stopped
     make USE_PGXS=1 install
@@ -238,6 +261,7 @@ absolute milliseconds are yours, not comparable with the table above.
     12  Add reproducible benchmarks, property tests and this README
     13  Ship the benchmark corpus instead of a recipe for building it
     14  Fail benchmarks when the expected RUM index plan is not used
+    15  Document a bundle import that works on the branch you are on
 
 Commits 2–8 are the prerequisite machinery — what makes a
 candidate-generating scan exist at all — and 9–11 are the ranked-search
