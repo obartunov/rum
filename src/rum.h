@@ -1003,7 +1003,6 @@ extern PGDLLEXPORT Datum rum_anyarray_distance(PG_FUNCTION_ARGS);
 
 /* GUC parameters */
 extern int		RumFuzzySearchLimit;
-extern bool		RumOrderedCandidatePruning;
 extern float8	RumArraySimilarityThreshold;
 extern int		RumArraySimilarityFunction;
 

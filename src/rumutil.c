@@ -39,8 +39,6 @@ PG_FUNCTION_INFO_V1(rumhandler);
 /* Kind of relation optioms for rum index */
 static relopt_kind rum_relopt_kind;
 
-bool		RumOrderedCandidatePruning = false;
-
 static const struct config_enum_entry rum_array_similarity_function_opts[] =
 {
 	{ "cosine",		SMT_COSINE,		false },
@@ -56,15 +54,6 @@ void
 _PG_init(void)
 {
 	/* Define custom GUC variables. */
-	DefineCustomBoolVariable("rum.ordered_candidate_pruning",
-							 "Let an ordered scan use candidate pruning for "
-							 "its search key (experimental).",
-							 NULL,
-							 &RumOrderedCandidatePruning,
-							 true,
-							 PGC_USERSET, 0,
-							 NULL, NULL, NULL);
-
 	DefineCustomIntVariable("rum_fuzzy_search_limit",
 				  "Sets the maximum allowed result for exact search by RUM.",
 							NULL,
