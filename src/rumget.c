@@ -929,22 +929,11 @@ startScan(IndexScanDesc scan)
 	}
 
 	/*
-	 * The fast scan keeps all entries of the scan in one array ordered by
-	 * cmpEntries() and looks for the border where preConsistent() turns
-	 * false, treating the array as a single stream of positions.  That
-	 * ordering is only positional within one attribute: cmpEntries()
-	 * compares attnumOrig first and never looks at the item pointers when
-	 * the attributes differ.  With entries over several attributes the array
-	 * is therefore grouped by attribute, the border search mistakes the
-	 * attribute boundary for a position boundary, and the scan shifts the
-	 * wrong entries -- it walks one attribute's postings to exhaustion
-	 * while the other never advances, returning no rows or none at all.
-	 *
-	 * Use the regular scan in that case.  The test is over the entries the
-	 * fast scan will actually sort, not over the search keys: an order-by
-	 * key on another attribute contributes entries of its own and brings
-	 * the same breakage in through a query such as
-	 * WHERE t1 @@ q1 ORDER BY t2 <=> q2.
+	 * cmpEntries() compares attnumOrig before the item pointers, so with
+	 * entries over several attributes sortedEntries is grouped by attribute
+	 * rather than ordered by position, and the border search below cannot be
+	 * used.  Test the entries, not the keys: an order-by key on another
+	 * attribute contributes entries of its own.
 	 */
 	if (scanType == RumFastScan)
 	{
@@ -1175,12 +1164,12 @@ startScan(IndexScanDesc scan)
 			cs->pendingValid = false;
 
 			/*
-			 * Research probe: can the order-by key's value be computed from
-			 * the match evidence?  Only when it is a duplicate of the search
-			 * key -- same attribute, same number of entries, and every entry
-			 * equal to a search-key entry under the opclass compare.  Early
-			 * TRUE from the candidate tri-consistent leaves the match
-			 * evidence complete, which the reuse below depends on.
+			 * The order-by key's value may be taken from the match evidence
+			 * only when that key duplicates the search key: same attribute,
+			 * same number of entries, and every entry equal to a search-key
+			 * entry under the opclass compare.  The reuse also depends on the
+			 * match evidence being complete for an emitted candidate, which
+			 * holds because every entry is probed before consistent runs.
 			 */
 			cs->rankKey = NULL;
 			cs->rankMap = NULL;

@@ -784,11 +784,11 @@ typedef struct RumCountingScanState
 	uint32		nSync;
 
 	/*
-	 * Research probe (rum.trgm_rank_from_match): when the order-by key is a
-	 * duplicate of the search key -- same attribute, same entries -- its
-	 * ordering can be computed from the evidence the match side already
-	 * gathered, instead of positioning its own entries again.  rankKey is
-	 * that key and rankMap[j] is the search-key entry equal to its entry j.
+	 * When the order-by key duplicates the search key -- same attribute,
+	 * same entries -- its ordering is computed from the evidence the match
+	 * side already gathered instead of positioning its own entries again.
+	 * rankKey is that key; rankMap[j] is the search-key entry equal to its
+	 * entry j.
 	 */
 	RumScanKey	rankKey;
 	int		   *rankMap;
