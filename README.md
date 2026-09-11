@@ -200,7 +200,7 @@ planner penalty: without that check a missing index yields a sequential
 scan, correct answers and a meaningless timing.
 
     bash bench/bench_ordered.sh timings      # the table above
-    bash bench/bench_ordered.sh controls     # negative controls
+    bash bench/bench_ordered.sh controls     # index results against seqscan
     bash bench/bench_writes.sh               # write-path control
 
 ### Correctness tests need no corpus at all

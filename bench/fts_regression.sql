@@ -1,8 +1,15 @@
--- Compare three modes on one binary for existing FTS ranking semantics.
---   A: both research GUCs off        (baseline)
---   B: ordered_candidate_pruning on
---   C: B + trgm_rank_from_match on
--- For every case: TID sequence, rank bytes (float4send), row count.
+-- Existing FTS ranking semantics must be unchanged by this branch.
+--
+-- This file records one run: for every case the TID sequence, the rank
+-- bytes (float4send) and the row count.  Comparison is against an
+-- unpatched RUM: run this file there on the same fixtures and diff the
+-- two outputs.  There is no run-time switch to compare against inside a
+-- single binary.
+--
+-- Comparing the index against a sequential scan instead does not work
+-- here: these cases use LIMIT, ties at the limit boundary are broken
+-- arbitrarily, and the two plans break them differently -- measured, the
+-- addon |=> case then differs in rank bytes as well as TIDs.
 \set ON_ERROR_STOP on
 SET enable_seqscan = off;
 SET max_parallel_workers_per_gather = 0;
@@ -81,25 +88,10 @@ BEGIN
     ORDER BY "time" |=> 500 LIMIT 50) s;
 END $$ LANGUAGE plpgsql;
 
-SELECT run_cases('A');
-
-SELECT run_cases('B');
-
-SELECT run_cases('C');
+SELECT run_cases('run');
 
 SELECT caseid
-    || ' rows=' || (SELECT count(*) FROM res r WHERE r.mode='A' AND r.caseid=x.caseid)
-    || ' B_tid=' || ((SELECT array_agg(tid ORDER BY rn) FROM res r WHERE r.mode='A' AND r.caseid=x.caseid)
-                 IS NOT DISTINCT FROM
-                     (SELECT array_agg(tid ORDER BY rn) FROM res r WHERE r.mode='B' AND r.caseid=x.caseid))
-    || ' B_rank=' || ((SELECT array_agg(rank ORDER BY rn) FROM res r WHERE r.mode='A' AND r.caseid=x.caseid)
-                  IS NOT DISTINCT FROM
-                      (SELECT array_agg(rank ORDER BY rn) FROM res r WHERE r.mode='B' AND r.caseid=x.caseid))
-    || ' C_tid=' || ((SELECT array_agg(tid ORDER BY rn) FROM res r WHERE r.mode='A' AND r.caseid=x.caseid)
-                 IS NOT DISTINCT FROM
-                     (SELECT array_agg(tid ORDER BY rn) FROM res r WHERE r.mode='C' AND r.caseid=x.caseid))
-    || ' C_rank=' || ((SELECT array_agg(rank ORDER BY rn) FROM res r WHERE r.mode='A' AND r.caseid=x.caseid)
-                  IS NOT DISTINCT FROM
-                      (SELECT array_agg(rank ORDER BY rn) FROM res r WHERE r.mode='C' AND r.caseid=x.caseid))
-   AS result
-FROM (SELECT DISTINCT caseid FROM res) x ORDER BY 1;
+    || ' rows=' || count(*)
+    || ' tids=' || md5(array_agg(tid ORDER BY rn)::text)
+    || ' ranks=' || md5(array_agg(rank ORDER BY rn)::text) AS result
+FROM res GROUP BY caseid ORDER BY 1;
