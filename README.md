@@ -62,6 +62,17 @@ Ranked trigram similarity, `WHERE body % q ORDER BY body <-> q LIMIT n`,
 | 0.10, LIMIT 10 | 722 ms | 367 ms | 279 ms |
 | 0.15, LIMIT 10 | 715 ms | 221 ms | 218 ms |
 
+The three columns are three states of this branch, not three settings of
+one build.  There is no run-time switch; to reproduce a column, check out
+its commit and measure:
+
+    baseline                  868de70
+    + candidate-aware ordered a8df1fc
+    + evidence reuse          7020f3c
+
+`bench/bench_ordered.sh timings` measures whichever checkout is installed,
+so on the branch tip it reproduces the last column only.
+
 **1.6x–3.5x on the tested ranked trigram similarity workload.** The same
 shape appears on a 10 000-document corpus, so the effect is not an
 artifact of the duplication used to build the larger one.
@@ -199,7 +210,7 @@ scan return the same number of rows.  `enable_seqscan = off` is only a
 planner penalty: without that check a missing index yields a sequential
 scan, correct answers and a meaningless timing.
 
-    bash bench/bench_ordered.sh timings      # the table above
+    bash bench/bench_ordered.sh timings      # this checkout
     bash bench/bench_ordered.sh controls     # index results against seqscan
     bash bench/bench_writes.sh               # write-path control
 
@@ -249,7 +260,7 @@ absolute milliseconds are yours, not comparable with the table above.
 
      1  Do not use the fast scan when its entries span several attributes
      2  Defer first-page decode of posting-tree scan entries
-     3  Add opclass query-minimum-match support
+     3  Add opclass query-minimum-match support (RUM_QUERY_MIN_MATCHES_PROC)
      4  Generate scan candidates from a sufficient subset of entries
      5  Refine the match bound per candidate from document-level addInfo
      6  Add rum_trgm: trigram similarity opclass for RUM
@@ -258,14 +269,16 @@ absolute milliseconds are yours, not comparable with the table above.
      9  Derive the candidate-generation cover from preConsistent
     10  Let compatible ordered scans use the candidate-aware path
     11  Reuse matching evidence for equivalent ordering keys
-    12  Add reproducible benchmarks, property tests and this README
+    12  Add reproducible benchmarks, property tests and a branch README
     13  Ship the benchmark corpus instead of a recipe for building it
     14  Fail benchmarks when the expected RUM index plan is not used
-    15  Document a bundle import that works on the branch you are on
+    15  Document a bundle import that works on the branch you are standing on
+    16  Trim branch-specific implementation comments
+    17  Drop the A/B/C benchmark modes, which measured one code path
+    18  Remove unused ordered candidate pruning GUC
 
 Commits 2–8 are the prerequisite machinery — what makes a
 candidate-generating scan exist at all — and 9–11 are the ranked-search
-work proper. Commits 12–14 are tests, benchmarks and their preconditions,
-and carry no access-method change. Commit 1 is independent of everything
-after it and can be
-taken on its own.
+work proper. Commits 12–18 are tests, benchmarks, documentation and
+cleanup, and carry no access-method change. Commit 1 is independent of
+everything after it and can be taken on its own.
