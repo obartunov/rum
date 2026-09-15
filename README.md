@@ -238,6 +238,14 @@ the 3 594 messages.  Run it only if you want a different corpus; then the
 absolute milliseconds are yours, not comparable with the table above.
 
 
+## Research
+
+Work on a next-generation RUM architecture and Top-K indexability
+experiments is documented in:
+
+- `docs/RUM2_DIRECTION.md`
+- `research/topk-level-I/RUM_TOPK_LEVEL_I.md`
+
 ## Scope / known limitations
 
 - Partial-match entries are outside this work. One query entry expanding

@@ -1,0 +1,558 @@
+diff --git a/src/rum.h b/src/rum.h
+index 4569d3c..1647985 100644
+--- a/src/rum.h
++++ b/src/rum.h
+@@ -1001,6 +1001,23 @@ extern PGDLLEXPORT Datum rum_anyarray_similar(PG_FUNCTION_ARGS);
+ extern PGDLLEXPORT Datum rum_anyarray_distance(PG_FUNCTION_ARGS);
+ 
+ 
++#ifdef RUM_RANK_STAGES
++extern uint64	StDocrepNs, StSortNs, StScoreNs, StTotalNs, StCalls, StDoclen;
++#endif
++
++#ifdef RUM_TOPK_PROBE
++extern int64	TopkBound;
++extern uint64	TopkCandidates, TopkCutoffSeen, TopkWarmup, TopkNoBound;
++extern uint64	TopkBoundChecks, TopkBoundPruned, TopkBoundViolations, TopkWrongPrune, TopkExactRanks;
++extern double	TopkLastCutoff;
++#endif
++
++extern int32 rum_count_positions(Datum addInfo);
++extern float8 rum_ts_distance_lower_bound(Datum *addInfo, bool *addInfoIsNull,
++										  int nkeys);
++extern float8 rum_bm25_distance_lower_bound(bool *entryRes, bool *addInfoIsNull,
++											double *idf, int nkeys);
++
+ /* GUC parameters */
+ extern int		RumFuzzySearchLimit;
+ extern float8	RumArraySimilarityThreshold;
+diff --git a/src/rum_ts_utils.c b/src/rum_ts_utils.c
+index eaab182..daeff35 100644
+--- a/src/rum_ts_utils.c
++++ b/src/rum_ts_utils.c
+@@ -27,6 +27,19 @@
+ 
+ #include "rum.h"
+ 
++#ifdef RUM_RANK_STAGES
++#include <time.h>
++uint64	StDocrepNs = 0, StSortNs = 0, StScoreNs = 0, StTotalNs = 0, StCalls = 0;
++uint64	StDoclen = 0;
++static uint64 st_ns(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64) ts.tv_sec * 1000000000 + ts.tv_nsec;
++}
++static uint64 StT0 = 0;
++#endif
++
+ #include <math.h>
+ 
+ /* Use TS_EXEC_PHRASE_AS_AND when TS_EXEC_PHRASE_NO_POS is not defined */
+@@ -1666,7 +1679,15 @@ get_docrep_addinfo(bool *check, QueryRepresentation *qr,
+ 
+ 	if (cur > 0)
+ 	{
++#ifdef RUM_RANK_STAGES
++		{
++			uint64 q0 = st_ns();
++			qsort((void *) doc, cur, sizeof(DocRepresentation), compareDocR);
++			StSortNs += st_ns() - q0;
++		}
++#else
+ 		qsort((void *) doc, cur, sizeof(DocRepresentation), compareDocR);
++#endif
+ 		return doc;
+ 	}
+ 
+@@ -1981,14 +2002,34 @@ calc_score_addinfo(float4 *arrdata, bool *check, TSQuery query,
+ 	qr.operandData = palloc0(sizeof(qr.operandData[0]) * nkeys);
+ 	qr.length = nkeys;
+ 
++#ifdef RUM_RANK_STAGES
++	StT0 = st_ns();
++	StCalls++;
++	{
++		uint64 d0 = st_ns();
++		doc = get_docrep_addinfo(check, &qr, addInfo, addInfoIsNull, &doclen);
++		StDocrepNs += st_ns() - d0;
++		StDoclen += doclen;
++	}
++#else
+ 	doc = get_docrep_addinfo(check, &qr, addInfo, addInfoIsNull, &doclen);
++#endif
+ 	if (!doc)
+ 	{
+ 		pfree(qr.operandData);
+ 		return 0.0;
+ 	}
+ 
++#ifdef RUM_RANK_STAGES
++	{
++		uint64 s0 = st_ns();
++		Wdoc = calc_score_docr(arrdata, doc, doclen, &qr, DEF_NORM_METHOD);
++		StScoreNs += st_ns() - s0;
++	}
++	StTotalNs += st_ns() - StT0;
++#else
+ 	Wdoc = calc_score_docr(arrdata, doc, doclen, &qr, DEF_NORM_METHOD);
++#endif
+ 
+ 	pfree(doc);
+ 	pfree(qr.operandData);
+@@ -2356,3 +2397,74 @@ rum_ts_join_pos(PG_FUNCTION_ARGS)
+ 
+ 	PG_RETURN_BYTEA_P(result);
+ }
++
++/*
++ * Optimistic lower bound on the <=> distance of a candidate.
++ *
++ * Derivation from calc_score_docr().  Per cover:
++ *
++ *     contribution = Cpos / (1 + nNoise) / L^2 / 1.64493406685
++ *     Cpos         = (entries in cover) / InvSum * nitems
++ *
++ * InvSum adds arrdata[wclass] per entry and the smallest entry in `weights`
++ * is 1.0, so Cpos <= nitems.  nNoise >= 0.  L counts covers already seen
++ * with the same key, so within one key group the contributions carry
++ * 1/1, 1/4, 1/9, ... and 1.64493406685 is exactly pi^2/6, the limit of that
++ * series: the whole group sums to at most one maximal contribution.
++ *
++ * So the score is bounded by the number of distinct cover keys times
++ * nitems, and a cover must contain an occurrence of every operand it
++ * covers, so there are at most min_i(npos_i) covers in total.
++ *
++ *     score <= min(ncovers, ndistinct_keys) * nitems
++ *
++ * ndistinct_keys is not known here, so the bound uses the cover count.
++ * DEF_NORM_METHOD is RANK_NO_NORM, so nothing scales the sum afterwards.
++ */
++float8
++rum_ts_distance_lower_bound(Datum *addInfo, bool *addInfoIsNull, int nkeys)
++{
++	return 0.0;				/* replaced by the BM25 bound below */
++}
++
++/*
++ * BM25 candidate bound, optimistic for a distance ordering.
++ *
++ * Per term f(tf) = idf * tf * (k1+1) / (tf + k1) increases in tf, with
++ * supremum idf * (k1+1) as tf grows.  So for the terms known to be present
++ * in this document, before their tf is read,
++ *
++ *     score < SUM_t idf_t * (k1 + 1)
++ *
++ * and the reciprocal is a lower bound on distance.  Only presence is used,
++ * which the merge already established; no tf, no positions, no document
++ * payload.
++ */
++float8
++rum_bm25_distance_lower_bound(bool *entryRes, bool *addInfoIsNull,
++							  double *idf, int nkeys)
++{
++	const double k1 = 1.2;
++	double		score_ub = 0.0;
++	int			i;
++
++	for (i = 0; i < nkeys; i++)
++	{
++		if (!entryRes[i] || addInfoIsNull[i])
++			continue;
++		score_ub += idf[i] * (k1 + 1.0);
++	}
++
++	if (score_ub <= 0.0)
++		return get_float8_infinity();
++	return 1.0 / score_ub;
++}
++
++/* number of positions in an addInfo payload, without decoding them */
++int32
++rum_count_positions(Datum addInfo)
++{
++	bytea	   *positions = DatumGetByteaP(addInfo);
++
++	return count_pos(VARDATA_ANY(positions), VARSIZE_ANY_EXHDR(positions));
++}
+diff --git a/src/rumget.c b/src/rumget.c
+index a123559..b60debf 100644
+--- a/src/rumget.c
++++ b/src/rumget.c
+@@ -28,6 +28,20 @@
+ #endif
+ #include "rum.h"
+ 
++#ifdef RUM_BM25_EXPERIMENT
++#include <math.h>
++/* collection size; an experiment, so a constant rather than a statistic */
++#define BM25_N 20000.0
++#endif
++
++#ifdef RUM_TOPK_PROBE
++int64	TopkBound = -1;
++uint64	TopkCandidates = 0, TopkCutoffSeen = 0, TopkWarmup = 0, TopkNoBound = 0;
++uint64	TopkBoundChecks = 0, TopkBoundPruned = 0, TopkBoundViolations = 0,
++		TopkWrongPrune = 0, TopkExactRanks = 0;
++double	TopkLastCutoff = 0;
++#endif
++
+ /* GUC parameter */
+ int			RumFuzzySearchLimit = 0;
+ 
+@@ -3259,6 +3273,44 @@ keyGetOrdering(RumState * rumstate, MemoryContext tempCtx, RumScanKey key,
+ 		}
+ 	}
+ 
++#ifdef RUM_BM25_EXPERIMENT
++	/*
++	 * EXPERIMENT: replace the opclass ordering with BM25 so that the whole
++	 * existing ordered-scan machinery -- tuple bound, bounded heap, cutoff --
++	 * runs unchanged.  b = 0: no length normalisation, so nothing beyond
++	 * addInfo and per-entry statistics is needed.
++	 *
++	 *   score = SUM_t idf_t * tf_t * (k1 + 1) / (tf_t + k1)
++	 *
++	 * idf comes from the entry's own posting-list estimate.
++	 */
++	{
++		double		score = 0.0;
++		const double k1 = 1.2;
++
++		for (i = 0; i < key->nentries; i++)
++		{
++			double		tf,
++						idf,
++						df;
++
++			if (!key->entryRes[i] || key->addInfoIsNull[i])
++				continue;
++			tf = (double) rum_count_positions(key->addInfo[i]);
++			if (tf <= 0)
++				continue;
++			df = (double) key->scanEntry[i]->predictNumberResult;
++			if (df < 1.0)
++				df = 1.0;
++			idf = log(1.0 + (BM25_N - df + 0.5) / (df + 0.5));
++			score += idf * tf * (k1 + 1.0) / (tf + k1);
++		}
++		if (score <= 0.0)
++			return get_float8_infinity();
++		return 1.0 / score;
++	}
++#endif
++
+ 	return DatumGetFloat8(FunctionCall10Coll(&rumstate->orderingFn[key->attnum - 1],
+ 								 rumstate->supportCollation[key->attnum - 1],
+ 											 PointerGetDatum(key->entryRes),
+@@ -3351,8 +3403,78 @@ insertScanItem(RumScanOpaque so, bool recheck)
+ 		if (!so->keys[i]->orderBy)
+ 			continue;
+ 
++#ifdef RUM_TOPK_PROBE
++		{
++			/*
++			 * Measurement only: compute the optimistic bound and the exact
++			 * distance, compare both against the current cutoff, and count.
++			 * Nothing is skipped yet -- first establish that the bound never
++			 * claims a candidate is worse than it turns out to be.
++			 */
++			float8	cutoff;
++			float8	lb;
++			bool	haveCutoff;
++#ifdef RUM_BM25_EXPERIMENT
++			{
++				double	idfbuf[64];
++				int		z;
++				int		n = Min(so->keys[i]->nentries, 64);
++
++				for (z = 0; z < n; z++)
++				{
++					double df = (double) so->keys[i]->scanEntry[z]->predictNumberResult;
++
++					if (df < 1.0)
++						df = 1.0;
++					idfbuf[z] = log(1.0 + (BM25_N - df + 0.5) / (df + 0.5));
++				}
++				lb = rum_bm25_distance_lower_bound(so->keys[i]->entryRes,
++												   so->keys[i]->addInfoIsNull,
++												   idfbuf, n);
++			}
++#else
++			lb = rum_ts_distance_lower_bound(so->keys[i]->addInfo,
++											 so->keys[i]->addInfoIsNull,
++											 so->keys[i]->nentries);
++#endif
++
++			haveCutoff = rum_tuplesort_get_cutoff(so->sortstate, &cutoff);
++			if (haveCutoff)
++				TopkBoundChecks++;
++
++#ifdef RUM_TOPK_PRUNE
++			/*
++			 * The candidate cannot reach the current top k, so its exact
++			 * ordering value is never needed.  Without a cutoff, or without
++			 * a bound, the exact value is computed as before.
++			 */
++			if (haveCutoff && lb >= cutoff)
++			{
++				TopkBoundPruned++;
++				return;
++			}
++#endif
++
++			item->data[j] = keyGetOrdering(&so->rumstate, so->tempCtx,
++										   so->keys[i], &so->item.iptr);
++			TopkExactRanks++;
++
++			if (lb > item->data[j])
++				TopkBoundViolations++;
++
++#ifndef RUM_TOPK_PRUNE
++			if (haveCutoff && lb >= cutoff)
++			{
++				TopkBoundPruned++;
++				if (item->data[j] < cutoff)
++					TopkWrongPrune++;
++			}
++#endif
++		}
++#else
+ 		item->data[j] = keyGetOrdering(&so->rumstate, so->tempCtx, so->keys[i],
+ 									   &so->item.iptr);
++#endif
+ 
+ 		j++;
+ 	}
+@@ -3421,9 +3543,37 @@ rumgettuple(IndexScanDesc scan, ScanDirection direction)
+ 			so->sortstate = rum_tuplesort_begin_rum(work_mem, so->norderbys,
+ 						false, so->scanType == RumFullScan);
+ 
++#ifdef RUM_TOPK_PROBE
++			/*
++			 * The executor's tuple bound, if it reached us.  Only a hint:
++			 * the sort may decline it, and until a bounded heap exists
++			 * there is no cutoff to prune against.
++			 */
++			TopkBound = scan->xs_tuples_needed;
++			if (scan->xs_tuples_needed > 0)
++				rum_tuplesort_set_bound(so->sortstate,
++										scan->xs_tuples_needed);
++#endif
++
+ 
+ 			while (scanGetItem(scan, &so->item, &so->item, &recheck))
+ 			{
++#ifdef RUM_TOPK_PROBE
++				{
++					float8	cutoff;
++
++					TopkCandidates++;
++					if (rum_tuplesort_get_cutoff(so->sortstate, &cutoff))
++					{
++						TopkCutoffSeen++;
++						TopkLastCutoff = cutoff;
++					}
++					else if (TopkBound <= 0)
++						TopkNoBound++;
++					else
++						TopkWarmup++;
++				}
++#endif
+ 				insertScanItem(so, recheck);
+ 			}
+ 			rum_tuplesort_performsort(so->sortstate);
+diff --git a/src/rumscan.c b/src/rumscan.c
+index 63134aa..7d32a29 100644
+--- a/src/rumscan.c
++++ b/src/rumscan.c
+@@ -740,6 +740,7 @@ void
+ rumrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+ 		  ScanKey orderbys, int norderbys)
+ {
++	elog(DEBUG1, "rum: AM sees tuples_needed=%ld", (long) scan->xs_tuples_needed);
+ 	/* remaining arguments are ignored */
+ 	RumScanOpaque so = (RumScanOpaque) scan->opaque;
+ 
+@@ -758,6 +759,25 @@ rumrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+ void
+ rumendscan(IndexScanDesc scan)
+ {
++#ifdef RUM_TOPK_PROBE
++	elog(DEBUG1, "topk: k=%ld candidates=%lu cutoff=%lu warmup=%lu checks=%lu pruned=%lu exact=%lu violations=%lu wrong=%lu",
++		 (long) TopkBound, (unsigned long) TopkCandidates,
++		 (unsigned long) TopkCutoffSeen, (unsigned long) TopkWarmup,
++		 (unsigned long) TopkBoundChecks, (unsigned long) TopkBoundPruned,
++		 (unsigned long) TopkExactRanks,
++		 (unsigned long) TopkBoundViolations, (unsigned long) TopkWrongPrune);
++	TopkCandidates = TopkCutoffSeen = TopkWarmup = TopkNoBound = 0;
++	TopkBoundChecks = TopkBoundPruned = TopkBoundViolations = TopkWrongPrune = 0;
++	TopkExactRanks = 0;
++	TopkBound = -1; TopkLastCutoff = 0;
++#endif
++#ifdef RUM_RANK_STAGES
++	elog(DEBUG1, "rank stages: calls=%lu doclen=%lu total=%lu docrep=%lu sort=%lu score=%lu",
++		 (unsigned long) StCalls, (unsigned long) StDoclen,
++		 (unsigned long) StTotalNs, (unsigned long) StDocrepNs,
++		 (unsigned long) StSortNs, (unsigned long) StScoreNs);
++	StCalls = StDoclen = StTotalNs = StDocrepNs = StSortNs = StScoreNs = 0;
++#endif
+ 	RumScanOpaque so = (RumScanOpaque) scan->opaque;
+ 
+ 	freeScanKeys(so);
+diff --git a/src/rumsort.c b/src/rumsort.c
+index 0472687..56cbd2b 100644
+--- a/src/rumsort.c
++++ b/src/rumsort.c
+@@ -190,18 +190,50 @@ comparetup_rum(const SortTuple *a, const SortTuple *b,
+ 	return compare_rum_itempointer(i1->iptr, i2->iptr);
+ }
+ 
++#if PG_VERSION_NUM >= 160000
++/*
++ * Ordering here is defined by comparetup_rum() alone; there is no
++ * SortSupport to carry a direction.  A bounded sort asks the variant to
++ * reverse itself, so keep the current direction next to the state and
++ * apply it in the comparator.
++ */
++typedef struct RumSortDirection
++{
++	bool		reverse;
++}			RumSortDirection;
++
++static void
++rum_tuplesort_reversedirection(RumTuplesortstate *state)
++{
++	RumSortDirection *dir = (RumSortDirection *) TSS_GET(state)->arg;
++
++	elog(DEBUG1, "rum reversedirection called, dir=%p", (void *) dir);
++	dir->reverse = !dir->reverse;
++}
++
++static inline int
++rum_apply_direction(RumTuplesortstate *state, int res)
++{
++	RumSortDirection *dir = (RumSortDirection *) TSS_GET(state)->arg;
++
++	return (dir != NULL && dir->reverse) ? -res : res;
++}
++#else
++#define rum_apply_direction(state, res)	(res)
++#endif
++
+ static int
+ comparetup_rum_true(const SortTuple *a, const SortTuple *b,
+ 					RumTuplesortstate *state)
+ {
+-	return comparetup_rum(a, b, state, true);
++	return rum_apply_direction(state, comparetup_rum(a, b, state, true));
+ }
+ 
+ static int
+ comparetup_rum_false(const SortTuple *a, const SortTuple *b,
+ 					 RumTuplesortstate *state)
+ {
+-	return comparetup_rum(a, b, state, false);
++	return rum_apply_direction(state, comparetup_rum(a, b, state, false));
+ }
+ 
+ static inline FmgrInfo *
+@@ -384,10 +416,17 @@ rum_tuplesort_begin_rum(int workMem, int nKeys, bool randomAccess,
+ 						bool compareItemPointer)
+ {
+ #if PG_VERSION_NUM >= 150000
++	/*
++	 * TUPLESORT_ALLOWBOUNDED must be requested here: tuplesort_set_bound()
++	 * asserts on it, and the flag also selects the tuple memory context
++	 * strategy, so a bounded sort cannot be turned on after the state
++	 * exists.
++	 */
+ 	RumTuplesortstate *state = tuplesort_begin_common(workMem,
+-													  randomAccess ?
+-													  TUPLESORT_RANDOMACCESS :
+-													  TUPLESORT_NONE);
++													  (randomAccess ?
++													   TUPLESORT_RANDOMACCESS :
++													   TUPLESORT_NONE) |
++													  TUPLESORT_ALLOWBOUNDED);
+ #else
+ 	RumTuplesortstate *state = tuplesort_begin_common(workMem, randomAccess);
+ #endif
+@@ -403,6 +442,14 @@ rum_tuplesort_begin_rum(int workMem, int nKeys, bool randomAccess,
+ 													  comparetup_rum_false;
+ 	TSS_GET(state)->writetup = writetup_rum;
+ 	TSS_GET(state)->readtup = readtup_rum;
++#if PG_VERSION_NUM >= 160000
++	{
++		RumSortDirection *dir = palloc0(sizeof(RumSortDirection));
++
++		TSS_GET(state)->arg = dir;
++		TSS_GET(state)->reversedirection = rum_tuplesort_reversedirection;
++	}
++#endif
+ 
+ 	MemoryContextSwitchTo(oldcontext);
+ 
+@@ -586,3 +633,48 @@ rum_tuplesort_getrumitem(RumTuplesortstate *state, bool forward,
+ 	return (RumScanItem *) rum_tuplesort_getrum_internal(state, forward,
+ 														 should_free);
+ }
++
++/*
++ * Ask for at most `bound` tuples.  Must be called before any tuple is put.
++ * The sort may still decline to use a bounded heap -- see
++ * optimize_bounded_sort and the size checks in tuplesort_set_bound -- in
++ * which case rum_tuplesort_get_cutoff() keeps reporting false.
++ */
++void
++rum_tuplesort_set_bound(RumTuplesortstate *state, int64 bound)
++{
++#if PG_VERSION_NUM >= 150000
++	elog(DEBUG1, "rum sort state before set_bound: nKeys=%d sortKeys=%p comparetup=%p",
++		 TSS_GET(state)->nKeys, (void *) TSS_GET(state)->sortKeys,
++		 (void *) TSS_GET(state)->comparetup);
++	tuplesort_set_bound(state, bound);
++	elog(DEBUG1, "set_bound returned");
++#endif
++}
++
++/*
++ * Current top-K cutoff: the worst ordering value among the tuples the
++ * bounded heap is keeping, by value.
++ *
++ * Returns false while no cutoff exists -- before the heap is built, or if
++ * the sort declined the bound.  A caller that gets false must do the full
++ * work; there is no cutoff to prune against.
++ *
++ * The value is copied out deliberately.  The heap root changes on the next
++ * put, so the caller must not hold a reference into the sort state.
++ */
++bool
++rum_tuplesort_get_cutoff(RumTuplesortstate *state, float8 *cutoff)
++{
++#if PG_VERSION_NUM >= 150000
++	Datum		root;
++
++	if (!tuplesort_get_bounded_root(state, &root))
++		return false;
++
++	*cutoff = DatumGetFloat8(root);
++	return true;
++#else
++	return false;
++#endif
++}
+diff --git a/src/rumsort.h b/src/rumsort.h
+index 15f691e..ef6dabb 100644
+--- a/src/rumsort.h
++++ b/src/rumsort.h
+@@ -46,6 +46,8 @@ extern RumTuplesortstate	*rum_tuplesort_begin_rumitem(int workMem,
+ extern void rum_tuplesort_putrum(RumTuplesortstate *state, RumSortItem * item);
+ extern void rum_tuplesort_putrumitem(RumTuplesortstate *state, struct RumScanItem * item);
+ 
++extern void rum_tuplesort_set_bound(RumTuplesortstate *state, int64 bound);
++extern bool rum_tuplesort_get_cutoff(RumTuplesortstate *state, float8 *cutoff);
+ extern void rum_tuplesort_performsort(RumTuplesortstate *state);
+ 
+ extern RumSortItem *rum_tuplesort_getrum(RumTuplesortstate *state, bool forward,

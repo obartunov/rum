@@ -1,0 +1,222 @@
+diff --git a/src/backend/access/index/genam.c b/src/backend/access/index/genam.c
+index 1408989..f3cba38 100644
+--- a/src/backend/access/index/genam.c
++++ b/src/backend/access/index/genam.c
+@@ -102,7 +102,8 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
+ 	else
+ 		scan->orderByData = NULL;
+ 
+-	scan->xs_want_itup = false; /* may be set later */
++	scan->xs_want_itup = false;
++	scan->xs_tuples_needed = -1;	/* EXPERIMENT: unbounded by default */ /* may be set later */
+ 
+ 	/*
+ 	 * During recovery we ignore killed tuples and don't bother to kill them
+diff --git a/src/backend/executor/execProcnode.c b/src/backend/executor/execProcnode.c
+index 7c4c66e..7cf38e5 100644
+--- a/src/backend/executor/execProcnode.c
++++ b/src/backend/executor/execProcnode.c
+@@ -72,6 +72,7 @@
+  */
+ #include "postgres.h"
+ 
++#include "access/relscan.h"
+ #include "executor/executor.h"
+ #include "executor/instrument.h"
+ #include "executor/nodeAgg.h"
+@@ -932,6 +933,23 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
+ 		if (subqueryState->ss.ps.qual == NULL)
+ 			ExecSetTupleBound(tuples_needed, subqueryState->subplan);
+ 	}
++	else if (IsA(child_node, IndexScanState))
++	{
++		/*
++		 * EXPERIMENT: hand the bound to the index AM.  An IndexScan neither
++		 * discards nor combines rows by itself, so the bound applies
++		 * unchanged -- but only when the scan filters nothing above the AM,
++		 * since then the AM's top k would be the wrong k.
++		 */
++		IndexScanState *istate = (IndexScanState *) child_node;
++
++		if (istate->ss.ps.qual == NULL)
++		{
++			istate->iss_TuplesNeeded = tuples_needed;
++			if (istate->iss_ScanDesc)
++				istate->iss_ScanDesc->xs_tuples_needed = tuples_needed;
++		}
++	}
+ 	else if (IsA(child_node, GatherState))
+ 	{
+ 		/*
+diff --git a/src/backend/executor/nodeIndexscan.c b/src/backend/executor/nodeIndexscan.c
+index 6566150..16e0277 100644
+--- a/src/backend/executor/nodeIndexscan.c
++++ b/src/backend/executor/nodeIndexscan.c
+@@ -118,6 +118,7 @@ IndexNext(IndexScanState *node)
+ 								   SO_HINT_REL_READ_ONLY : SO_NONE);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		scandesc->xs_tuples_needed = node->iss_TuplesNeeded;	/* EXPERIMENT */
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
+@@ -216,6 +217,7 @@ IndexNextWithReorder(IndexScanState *node)
+ 								   SO_HINT_REL_READ_ONLY : SO_NONE);
+ 
+ 		node->iss_ScanDesc = scandesc;
++		scandesc->xs_tuples_needed = node->iss_TuplesNeeded;	/* EXPERIMENT */
+ 
+ 		/*
+ 		 * If no run-time keys to calculate or they are ready, go ahead and
+@@ -923,6 +925,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
+ 	indexstate->ss.ps.plan = (Plan *) node;
+ 	indexstate->ss.ps.state = estate;
+ 	indexstate->ss.ps.ExecProcNode = ExecIndexScan;
++	indexstate->iss_TuplesNeeded = -1;	/* EXPERIMENT */
+ 
+ 	/*
+ 	 * Miscellaneous initialization
+diff --git a/src/backend/utils/sort/tuplesort.c b/src/backend/utils/sort/tuplesort.c
+index f676514..fe81f2b 100644
+--- a/src/backend/utils/sort/tuplesort.c
++++ b/src/backend/utils/sort/tuplesort.c
+@@ -738,6 +738,14 @@ tuplesort_set_bound(Tuplesortstate *state, int64 bound)
+ 	Assert(state->status == TSS_INITIAL && state->memtupcount == 0);
+ 	/* Assert we allow bounded sorts */
+ 	Assert(state->base.sortopt & TUPLESORT_ALLOWBOUNDED);
++
++	/*
++	 * A bounded sort must be able to reverse its order.  Decline the bound
++	 * rather than fail later if the variant offers neither sortKeys nor a
++	 * reversedirection callback.
++	 */
++	if (state->base.sortKeys == NULL && state->base.reversedirection == NULL)
++		return;
+ 	/* Can't set the bound twice, either */
+ 	Assert(!state->bounded);
+ 	/* Also, this shouldn't be called in a parallel worker */
+@@ -765,13 +773,16 @@ tuplesort_set_bound(Tuplesortstate *state, int64 bound)
+ 	 * optimization.  Disable by setting state to be consistent with no
+ 	 * abbreviation support.
+ 	 */
+-	state->base.sortKeys->abbrev_converter = NULL;
+-	if (state->base.sortKeys->abbrev_full_comparator)
+-		state->base.sortKeys->comparator = state->base.sortKeys->abbrev_full_comparator;
++	if (state->base.sortKeys != NULL)
++	{
++		state->base.sortKeys->abbrev_converter = NULL;
++		if (state->base.sortKeys->abbrev_full_comparator)
++			state->base.sortKeys->comparator = state->base.sortKeys->abbrev_full_comparator;
+ 
+-	/* Not strictly necessary, but be tidy */
+-	state->base.sortKeys->abbrev_abort = NULL;
+-	state->base.sortKeys->abbrev_full_comparator = NULL;
++		/* Not strictly necessary, but be tidy */
++		state->base.sortKeys->abbrev_abort = NULL;
++		state->base.sortKeys->abbrev_full_comparator = NULL;
++	}
+ }
+ 
+ /*
+@@ -3150,9 +3161,18 @@ tuplesort_heap_replace_top(Tuplesortstate *state, SortTuple *tuple)
+ static void
+ reversedirection(Tuplesortstate *state)
+ {
+-	SortSupport sortKey = state->base.sortKeys;
++	SortSupport sortKey;
+ 	int			nkey;
+ 
++	/* A variant that orders through comparetup reverses itself. */
++	if (state->base.reversedirection != NULL)
++	{
++		state->base.reversedirection(state);
++		return;
++	}
++
++	sortKey = state->base.sortKeys;
++
+ 	for (nkey = 0; nkey < state->base.nKeys; nkey++, sortKey++)
+ 	{
+ 		sortKey->ssup_reverse = !sortKey->ssup_reverse;
+@@ -3500,3 +3520,20 @@ ssup_datum_int32_cmp(Datum x, Datum y, SortSupport ssup)
+ 	else
+ 		return 0;
+ }
++
++/*
++ * Current cutoff of a bounded sort: the worst tuple among those being kept.
++ *
++ * Returns false when no such value exists -- before the bounded heap is
++ * built, or when the sort declined the bound.  The value is returned by
++ * copy; the root changes on the next put.
++ */
++bool
++tuplesort_get_bounded_root(Tuplesortstate *state, Datum *root)
++{
++	if (state->status != TSS_BOUNDED || state->memtupcount <= 0)
++		return false;
++
++	*root = state->memtuples[0].datum1;
++	return true;
++}
+diff --git a/src/include/access/relscan.h b/src/include/access/relscan.h
+index 2ea06a6..bf286cf 100644
+--- a/src/include/access/relscan.h
++++ b/src/include/access/relscan.h
+@@ -202,6 +202,15 @@ typedef struct IndexScanDescData
+ 
+ 	/* parallel index scan information, in shared memory */
+ 	struct ParallelIndexScanDescData *parallel_scan;
++
++	/*
++	 * EXPERIMENT: upper bound on the number of tuples the executor will
++	 * demand from this scan, or -1 for unbounded.  Set from
++	 * ExecSetTupleBound; see nodeLimit.c.  Placed last so that adding it
++	 * cannot move any existing field.
++	 */
++	int64		xs_tuples_needed;
++
+ } IndexScanDescData;
+ 
+ /* Generic structure for parallel scans */
+diff --git a/src/include/nodes/execnodes.h b/src/include/nodes/execnodes.h
+index f0cb214..bb7de25 100644
+--- a/src/include/nodes/execnodes.h
++++ b/src/include/nodes/execnodes.h
+@@ -1760,6 +1760,7 @@ typedef struct IndexScanState
+ 	bool		iss_RuntimeKeysReady;
+ 	ExprContext *iss_RuntimeContext;
+ 	Relation	iss_RelationDesc;
++	int64		iss_TuplesNeeded;	/* EXPERIMENT: bound from ExecSetTupleBound */
+ 	struct IndexScanDescData *iss_ScanDesc;
+ 	IndexScanInstrumentation *iss_Instrument;
+ 	SharedIndexScanInstrumentation *iss_SharedInfo;
+diff --git a/src/include/utils/tuplesort.h b/src/include/utils/tuplesort.h
+index da68f45..bcb25be 100644
+--- a/src/include/utils/tuplesort.h
++++ b/src/include/utils/tuplesort.h
+@@ -217,6 +217,16 @@ typedef struct
+ 	bool		tuples;			/* Can SortTuple.tuple ever be set? */
+ 
+ 	void	   *arg;			/* Specific information for the sort variant */
++
++	/*
++	 * Reverse the sort order.  A bounded sort needs this to build a heap
++	 * whose root is the worst tuple being kept.  Variants that order through
++	 * sortKeys leave this NULL and the default handling applies; a variant
++	 * that orders purely through comparetup must supply it, or
++	 * tuplesort_set_bound() declines the bound.  Placed last so that adding
++	 * it moves no existing field.
++	 */
++	void		(*reversedirection) (Tuplesortstate *state);
+ } TuplesortPublic;
+ 
+ /* Sort parallel code from state for sort__start probes */
+@@ -343,6 +353,7 @@ extern Tuplesortstate *tuplesort_begin_common(int workMem,
+ 											  SortCoordinate coordinate,
+ 											  int sortopt);
+ extern void tuplesort_set_bound(Tuplesortstate *state, int64 bound);
++extern bool tuplesort_get_bounded_root(Tuplesortstate *state, Datum *root);
+ extern bool tuplesort_used_bound(Tuplesortstate *state);
+ extern void tuplesort_puttuple_common(Tuplesortstate *state,
+ 									  SortTuple *tuple, bool useAbbrev,
